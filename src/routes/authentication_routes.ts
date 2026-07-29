@@ -316,6 +316,51 @@ router.patch("/user/profile", verifyPlayerToken, async (req: AuthenticatedReques
 });
 
 const preferenceSchema = z.object({ ageGroupId: z.string().uuid(), categoryId: z.string().uuid() });
+router.get("/user/dashboard-bootstrap", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
+  const [player, preferences, notifications] = await Promise.all([
+    pool.query(
+      `SELECT u.id,u.name,u.username,u.email,u.coins_count,u.lives_remaining,
+              s.max_lives,s.passing_score_percent,s.refill_coin_cost
+       FROM users u CROSS JOIN gameplay_settings s
+       WHERE u.id=$1 AND s.id=1`,
+      [req.user!.id],
+    ),
+    pool.query("SELECT age_group_id,category_id,updated_at FROM player_preferences WHERE user_id=$1", [req.user!.id]),
+    pool.query(
+      `SELECT COUNT(*)::int unread_count
+       FROM notifications n
+       CROSS JOIN users u
+       LEFT JOIN notification_reads nr ON nr.notification_id=n.id AND nr.user_id=u.id
+       WHERE u.id=$1 AND n.published_at<=NOW()
+         AND (n.audience='all' OR (n.audience='verified' AND u.is_verified=true)
+           OR (n.audience='unverified' AND u.is_verified=false))
+         AND nr.user_id IS NULL`,
+      [req.user!.id],
+    ),
+  ]);
+  if (!player.rows[0]) return res.status(404).json({ success: false, message: "Player not found." });
+  const preference = preferences.rows[0];
+  return res.json({
+    success: true,
+    user: {
+      id: player.rows[0].id,
+      name: player.rows[0].name,
+      username: player.rows[0].username,
+      email: player.rows[0].email,
+    },
+    wallet: {
+      coins_count: player.rows[0].coins_count,
+      lives_remaining: player.rows[0].lives_remaining,
+      max_lives: player.rows[0].max_lives,
+      passing_score_percent: player.rows[0].passing_score_percent,
+      refill_coin_cost: player.rows[0].refill_coin_cost,
+    },
+    unreadCount: Number(notifications.rows[0]?.unread_count || 0),
+    learningSelection: preference
+      ? { ageGroupId: preference.age_group_id, categoryId: preference.category_id, updatedAt: preference.updated_at }
+      : null,
+  });
+});
 router.get("/user/preferences", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
   const result = await pool.query("SELECT age_group_id,category_id,updated_at FROM player_preferences WHERE user_id=$1", [req.user!.id]);
   const row = result.rows[0];
