@@ -8,6 +8,7 @@ import sanitizeHtml from "sanitize-html";
 import pool from "../config/database_connection";
 import { logActivity } from "../helpers/activityLog";
 import { verifyAdminToken } from "../middlewares/authentication_middleware";
+import { generateQuestionDrafts } from "../services/ai_question_service";
 
 const router = Router();
 const uploadRoot = path.resolve(process.cwd(), "uploads", "questions");
@@ -37,6 +38,38 @@ const mediaUrl = (file?: Express.Multer.File) => file ? `/uploads/questions/${fi
 const cleanup = (files: Express.Multer.File[]) => files.forEach((file) => fs.unlink(file.path, () => undefined));
 const cleanRichText = (value: string) => sanitizeHtml(value, { allowedTags: ["p","br","strong","b","em","i","u","s","ul","ol","li","div"], allowedAttributes: { div: ["style"], p: ["style"] }, allowedStyles: { "*": { "text-align": [/^left$/, /^center$/, /^right$/] } } });
 const plainText = (value: string) => sanitizeHtml(value, { allowedTags: [], allowedAttributes: {} }).replace(/&nbsp;/g, " ").trim();
+const generationSchema = z.object({
+  ageGroupId: z.string().uuid(), categoryId: z.string().uuid(), levelId: z.string().uuid(),
+  count: z.number().int().min(1).max(20).default(5),
+  guidance: z.string().trim().max(2000).default(""),
+});
+
+router.post("/admin/questions/ai/generate", verifyAdminToken, async (req, res) => {
+  const parsed = generationSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ success: false, message: parsed.error.issues[0]?.message || "Invalid generation request." });
+  const data = parsed.data;
+  const hierarchy = await pool.query(
+    `SELECT a.name age_group_name,a.min_age,a.max_age,c.name category_name,c.description category_description,
+      l.name level_name,l.level_number,l.description level_description
+     FROM age_groups a JOIN game_categories c ON c.age_group_id=a.id JOIN game_levels l ON l.category_id=c.id
+     WHERE a.id=$1 AND c.id=$2 AND l.id=$3`,
+    [data.ageGroupId, data.categoryId, data.levelId],
+  );
+  const context = hierarchy.rows[0];
+  if (!context) return res.status(400).json({ success: false, message: "The selected age group, category, and level do not match." });
+  try {
+    const generated = await generateQuestionDrafts({
+      count: data.count, guidance: data.guidance,
+      ageGroupName: context.age_group_name, minAge: Number(context.min_age), maxAge: Number(context.max_age),
+      categoryName: context.category_name, categoryDescription: context.category_description || "",
+      levelName: context.level_name, levelNumber: Number(context.level_number), levelDescription: context.level_description || "",
+    });
+    await logActivity({ eventType: "content.questions_ai_generated", title: "AI question drafts generated", description: `${generated.questions.length} drafts generated for ${context.level_name}`, metadata: { levelId: data.levelId, count: generated.questions.length, responseId: generated.responseId } });
+    return res.json({ success: true, questions: generated.questions });
+  } catch (error: any) {
+    return res.status(error.status || 500).json({ success: false, message: error.message || "Questions could not be generated." });
+  }
+});
 
 router.post("/admin/questions", verifyAdminToken, upload.fields(fields), async (req, res) => {
   const fileMap = (req.files || {}) as Record<string, Express.Multer.File[]>;
