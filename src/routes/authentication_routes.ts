@@ -16,6 +16,7 @@ import {
   ResendOtpSchema, ResetPasswordSchema, UpdatePassword, VerifyOtpSchema,
   UpdateProfileSchema,
 } from "../schemas/authentication_schema";
+import { z } from "zod";
 
 const router = Router();
 const googleClient = new OAuth2Client(env.GOOGLE_CLIENT_ID || undefined);
@@ -46,12 +47,13 @@ router.post("/admin/login", sensitiveLimiter, async (req, res) => {
   }
 
   try {
-    const result = await pool.query("SELECT id,name,email,password,role,is_verified,token_version FROM users WHERE lower(email)=$1 AND role='admin'", [email]);
+    const result = await pool.query("SELECT id,name,email,password,role,is_verified,is_active,admin_title,admin_permissions,token_version FROM users WHERE lower(email)=$1 AND role='admin'", [email]);
     const admin = result.rows[0];
     const matches = admin?.password ? await comparePassword(validation.data.password, admin.password) : false;
     if (!matches) return res.status(401).json({ success: false, message: "Invalid admin email or password." });
     if (!admin.is_verified) return res.status(403).json({ success: false, message: "Verify this admin account before signing in." });
-    const user = { id: admin.id, name: admin.name, email: admin.email, role: "Administrator", permissions: [] };
+    if (!admin.is_active) return res.status(403).json({ success: false, message: "This administrator account has been deactivated." });
+    const user = { id: admin.id, name: admin.name, email: admin.email, role: admin.admin_title, permissions: admin.admin_permissions || [] };
     await logActivity({ eventType: "admin.signed_in", title: "Admin signed in", description: `${admin.name} signed in`, actorId: admin.id, actorName: admin.name });
     return res.json({ success: true, message: "Admin sign in successful.", token: signAdminSession(admin), user });
   } catch (error) {
@@ -172,6 +174,101 @@ router.get("/admin/activities", verifyAdminToken, async (req, res) => {
     console.error("Admin activity listing failed", error);
     return res.status(500).json({ success: false, message: "Activities could not be loaded." });
   }
+});
+
+const adminPermissions = ["dashboard","user-management","content","leaderboard","coin-system","daily-rewards","categories","notifications","settings","admins"] as const;
+const createAdminSchema = z.object({
+  name: z.string().trim().min(2).max(120), email: z.string().trim().email(),
+  password: z.string().min(10).max(128), title: z.string().trim().min(2).max(80),
+  permissions: z.array(z.enum(adminPermissions)).min(1),
+});
+const updateAdminSchema = createAdminSchema.omit({ password: true });
+const adminProfileSchema = z.object({ name: z.string().trim().min(2).max(120), title: z.string().trim().min(2).max(80) });
+const ensureSuperAdmin = (req: AuthenticatedRequest, res: any) => {
+  if (req.user?.role !== "super_admin" || req.user.id !== "super-admin") {
+    res.status(403).json({ success: false, message: "Only the Super Admin can manage administrator accounts." });
+    return false;
+  }
+  return true;
+};
+
+router.get("/admin/admins", verifyAdminToken, async (req: AuthenticatedRequest, res) => {
+  if (!ensureSuperAdmin(req, res)) return;
+  const result = await pool.query(`SELECT id,name,email,admin_title title,admin_permissions permissions,is_active,created_at
+    FROM users WHERE role='admin' ORDER BY created_at DESC`);
+  return res.json({ success: true, admins: [
+    { id: "super-admin", name: "Super Admin", email: env.SUPER_ADMIN_EMAIL, title: "Super Admin", permissions: ["*"], is_active: true },
+    ...result.rows,
+  ] });
+});
+
+router.post("/admin/admins", verifyAdminToken, async (req: AuthenticatedRequest, res) => {
+  if (!ensureSuperAdmin(req, res)) return;
+  const parsed = createAdminSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ success: false, message: parsed.error.issues[0]?.message || "Invalid administrator details." });
+  const d = parsed.data;
+  try {
+    const result = await pool.query(`INSERT INTO users(name,username,email,password,role,is_verified,is_active,admin_title,admin_permissions)
+      VALUES($1,$2,$3,$4,'admin',true,true,$5,$6) RETURNING id,name,email,admin_title title,admin_permissions permissions,is_active,created_at`,
+      [d.name, `admin_${crypto.randomUUID().slice(0,8)}`, normalizeEmail(d.email), await hashPassword(d.password), d.title, JSON.stringify([...new Set(d.permissions)])]);
+    await logActivity({ eventType: "admin.created", title: "Administrator created", description: `${d.name} was granted dashboard access`, actorName: "Super Admin", metadata: { adminId: result.rows[0].id } });
+    return res.status(201).json({ success: true, admin: result.rows[0] });
+  } catch (error: any) {
+    if (error.code === "23505") return res.status(409).json({ success: false, message: "An account with that email already exists." });
+    throw error;
+  }
+});
+
+router.patch("/admin/admins/:id/status", verifyAdminToken, async (req: AuthenticatedRequest, res) => {
+  if (!ensureSuperAdmin(req, res)) return;
+  const parsed = z.object({ isActive: z.boolean() }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ success: false, message: "A valid account status is required." });
+  const result = await pool.query(`UPDATE users SET is_active=$1,token_version=CASE WHEN $1 THEN token_version ELSE token_version+1 END,updated_at=NOW()
+    WHERE id=$2 AND role='admin' RETURNING id,name,is_active`, [parsed.data.isActive, req.params.id]);
+  if (!result.rows[0]) return res.status(404).json({ success: false, message: "Administrator not found." });
+  return res.json({ success: true, message: parsed.data.isActive ? "Administrator reactivated." : "Administrator access revoked.", admin: result.rows[0] });
+});
+
+router.patch("/admin/admins/:id", verifyAdminToken, async (req: AuthenticatedRequest, res) => {
+  if (!ensureSuperAdmin(req, res)) return;
+  const parsed = updateAdminSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ success: false, message: parsed.error.issues[0]?.message || "Invalid administrator details." });
+  const d = parsed.data;
+  try {
+    const result = await pool.query(`UPDATE users SET name=$1,email=$2,admin_title=$3,admin_permissions=$4,updated_at=NOW()
+      WHERE id=$5 AND role='admin' RETURNING id,name,email,admin_title title,admin_permissions permissions,is_active,created_at`,
+      [d.name, normalizeEmail(d.email), d.title, JSON.stringify([...new Set(d.permissions)]), req.params.id]);
+    if (!result.rows[0]) return res.status(404).json({ success: false, message: "Administrator not found." });
+    return res.json({ success: true, message: "Administrator updated.", admin: result.rows[0] });
+  } catch (error: any) {
+    if (error.code === "23505") return res.status(409).json({ success: false, message: "An account with that email already exists." });
+    throw error;
+  }
+});
+
+router.get("/admin/account", verifyAdminToken, async (req: AuthenticatedRequest, res) => {
+  if (req.user!.role === "super_admin") return res.json({ success: true, account: { id: "super-admin", name: "Super Admin", email: env.SUPER_ADMIN_EMAIL, title: "Super Admin", permissions: ["*"], managedByEnvironment: true } });
+  const result = await pool.query("SELECT id,name,email,admin_title title,admin_permissions permissions,created_at,updated_at FROM users WHERE id=$1 AND role='admin'", [req.user!.id]);
+  if (!result.rows[0]) return res.status(404).json({ success: false, message: "Administrator account not found." });
+  return res.json({ success: true, account: result.rows[0] });
+});
+
+router.patch("/admin/account", verifyAdminToken, async (req: AuthenticatedRequest, res) => {
+  if (req.user!.role === "super_admin") return res.status(409).json({ success: false, message: "The Super Admin profile is managed through backend environment settings." });
+  const parsed = adminProfileSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ success: false, message: parsed.error.issues[0]?.message || "Invalid profile details." });
+  const result = await pool.query("UPDATE users SET name=$1,admin_title=$2,updated_at=NOW() WHERE id=$3 AND role='admin' RETURNING id,name,email,admin_title title,admin_permissions permissions,updated_at", [parsed.data.name, parsed.data.title, req.user!.id]);
+  return res.json({ success: true, message: "Admin profile updated.", account: result.rows[0] });
+});
+
+router.post("/admin/account/password", verifyAdminToken, async (req: AuthenticatedRequest, res) => {
+  if (req.user!.role === "super_admin") return res.status(409).json({ success: false, message: "Change the Super Admin password through SUPER_ADMIN_PASSWORD in the backend environment." });
+  const parsed = UpdatePassword.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ success: false, message: parsed.error.issues[0]?.message || "Invalid password details." });
+  const current = await pool.query("SELECT password FROM users WHERE id=$1 AND role='admin'", [req.user!.id]);
+  if (!current.rows[0]?.password || !(await comparePassword(parsed.data.currentPassword, current.rows[0].password))) return res.status(401).json({ success: false, message: "Current password is incorrect." });
+  await pool.query("UPDATE users SET password=$1,token_version=token_version+1,updated_at=NOW() WHERE id=$2", [await hashPassword(parsed.data.newPassword), req.user!.id]);
+  return res.json({ success: true, message: "Password updated. Please sign in again." });
 });
 
 router.get("/user/profile", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
