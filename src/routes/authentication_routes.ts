@@ -315,6 +315,24 @@ router.patch("/user/profile", verifyPlayerToken, async (req: AuthenticatedReques
   }
 });
 
+const preferenceSchema = z.object({ ageGroupId: z.string().uuid(), categoryId: z.string().uuid() });
+router.get("/user/preferences", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
+  const result = await pool.query("SELECT age_group_id,category_id,updated_at FROM player_preferences WHERE user_id=$1", [req.user!.id]);
+  const row = result.rows[0];
+  return res.json({ success: true, learningSelection: row ? { ageGroupId: row.age_group_id, categoryId: row.category_id, updatedAt: row.updated_at } : null });
+});
+router.put("/user/preferences/learning-selection", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
+  const parsed = preferenceSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ success: false, message: "Choose a valid age group and category." });
+  const d = parsed.data;
+  const hierarchy = await pool.query("SELECT 1 FROM game_categories WHERE id=$1 AND age_group_id=$2", [d.categoryId, d.ageGroupId]);
+  if (!hierarchy.rowCount) return res.status(400).json({ success: false, message: "That category does not belong to the selected age group." });
+  const result = await pool.query(`INSERT INTO player_preferences(user_id,age_group_id,category_id) VALUES($1,$2,$3)
+    ON CONFLICT(user_id) DO UPDATE SET age_group_id=EXCLUDED.age_group_id,category_id=EXCLUDED.category_id,updated_at=NOW()
+    RETURNING age_group_id,category_id,updated_at`, [req.user!.id, d.ageGroupId, d.categoryId]);
+  return res.json({ success: true, learningSelection: { ageGroupId: result.rows[0].age_group_id, categoryId: result.rows[0].category_id, updatedAt: result.rows[0].updated_at } });
+});
+
 router.post("/user/register", sensitiveLimiter, async (req, res) => {
   const validation = RegisterUserSchema.safeParse(req.body);
   if (!validation.success) return res.status(400).json({ success: false, errors: validation.error.issues });
