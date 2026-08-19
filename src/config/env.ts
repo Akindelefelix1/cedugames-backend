@@ -22,6 +22,10 @@ const EnvSchema = z.object({
   OPENAI_API_KEY: z.string().default(""),
   OPENAI_QUESTION_MODEL: z.string().min(1).default("gpt-5.6"),
   OPENAI_TIMEOUT_MS: z.coerce.number().int().min(5000).max(120000).default(60000),
+  CLOUDINARY_CLOUD_NAME: z.string().default(""),
+  CLOUDINARY_API_KEY: z.string().default(""),
+  CLOUDINARY_API_SECRET: z.string().default(""),
+  CLOUDINARY_FOLDER: z.string().trim().min(1).default("cedugames"),
 });
 
 const parsed = EnvSchema.safeParse(process.env);
@@ -35,6 +39,9 @@ if (parsed.data.NODE_ENV === "production") {
     !parsed.data.ZOHO_MAIL_FROM && "ZOHO_MAIL_FROM",
     !parsed.data.FLW_SECRET_KEY && "FLW_SECRET_KEY",
     !parsed.data.FLW_SECRET_HASH && "FLW_SECRET_HASH",
+    !parsed.data.CLOUDINARY_CLOUD_NAME && "CLOUDINARY_CLOUD_NAME",
+    !parsed.data.CLOUDINARY_API_KEY && "CLOUDINARY_API_KEY",
+    !parsed.data.CLOUDINARY_API_SECRET && "CLOUDINARY_API_SECRET",
   ].filter(Boolean);
   if (missing.length) throw new Error(`Missing production configuration: ${missing.join(", ")}`);
 }
