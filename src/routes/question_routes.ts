@@ -31,7 +31,7 @@ const bodySchema = z.object({
   options: z.string().transform((value, ctx) => { try { return z.array(optionSchema).length(4).parse(JSON.parse(value)); } catch { ctx.addIssue({ code: "custom", message: "Four valid options are required." }); return z.NEVER; } }),
 });
 const storeFiles = async (fileMap: Record<string, Express.Multer.File[]>) => {
-  const entries = await Promise.all(Object.entries(fileMap).map(async ([field, files]) => [field, await Promise.all(files.map(uploadMedia))] as const));
+  const entries = await Promise.all(Object.entries(fileMap).map(async ([field, files]) => [field, await Promise.all(files.map((file) => uploadMedia(file)))] as const));
   return Object.fromEntries(entries) as Record<string, StoredMedia[]>;
 };
 const storedMedia = (fileMap: Record<string, StoredMedia[]>, field: string) => fileMap[field]?.[0];
@@ -178,7 +178,7 @@ router.get("/admin/levels/:levelId/questions", verifyAdminToken, async (req, res
 });
 
 router.get("/catalog/levels/:levelId/questions", async (req, res) => {
-  const result = await pool.query(`SELECT q.id,q.question_text,q.explanation,q.media_url,q.media_type,q.shape_type,q.shape_color,l.points_per_question,l.time_limit_seconds,COALESCE(json_agg(json_build_object('id',o.id,'text',o.option_text,'mediaUrl',o.media_url,'mediaType',o.media_type,'isCorrect',o.is_correct,'shapeType',o.shape_type,'shapeColor',o.shape_color) ORDER BY o.option_order) FILTER (WHERE o.id IS NOT NULL),'[]') options FROM questions q JOIN game_levels l ON l.id=q.level_id LEFT JOIN question_options o ON o.question_id=q.id WHERE q.level_id=$1 AND q.status='published' GROUP BY q.id,l.points_per_question,l.time_limit_seconds ORDER BY q.created_at`, [req.params.levelId]);
+  const result = await pool.query(`SELECT q.id,q.question_text,q.explanation,q.media_url,q.media_type,q.shape_type,q.shape_color,l.points_per_question,l.time_limit_seconds,COALESCE(json_agg(json_build_object('id',o.id,'text',o.option_text,'mediaUrl',o.media_url,'mediaType',o.media_type,'isCorrect',o.is_correct,'shapeType',o.shape_type,'shapeColor',o.shape_color) ORDER BY o.option_order) FILTER (WHERE o.id IS NOT NULL),'[]') options FROM questions q JOIN game_levels l ON l.id=q.level_id LEFT JOIN question_options o ON o.question_id=q.id WHERE q.level_id=$1 AND q.status='published' GROUP BY q.id,l.points_per_question,l.time_limit_seconds ORDER BY random()`, [req.params.levelId]);
   res.json({ success: true, questions: result.rows.map((row: Record<string, any>) => ({ id: row.id, text: row.question_text, explanation: row.explanation, mediaUrl: row.media_url, mediaType: row.media_type, shapeType: row.shape_type, shapeColor: row.shape_color, points: row.points_per_question, timeLimit: row.time_limit_seconds, options: row.options.map(({ isCorrect: _hidden, ...option }: Record<string, unknown>) => option) })) });
 });
 

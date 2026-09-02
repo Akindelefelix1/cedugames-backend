@@ -10,6 +10,7 @@ import dashboardRoutes from "./dashboard_routes";
 import badgeRoutes from "./badge_routes";
 import notificationRoutes from "./notification_routes";
 import dailyCheckinRoutes from "./daily_checkin_routes";
+import mediaRoutes from "./media_routes";
 import {Router} from 'express';
 
 const router = Router();
@@ -25,5 +26,6 @@ router.use(dashboardRoutes);
 router.use(badgeRoutes);
 router.use(notificationRoutes);
 router.use(dailyCheckinRoutes);
+router.use(mediaRoutes);
 
 export default router;

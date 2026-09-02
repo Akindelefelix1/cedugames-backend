@@ -14,13 +14,13 @@ export type StoredMedia = {
   resourceType: string;
 };
 
-export const uploadMedia = (file: Express.Multer.File): Promise<StoredMedia> => new Promise((resolve, reject) => {
+export const uploadMedia = (file: Express.Multer.File, subfolder = "questions"): Promise<StoredMedia> => new Promise((resolve, reject) => {
   if (!env.CLOUDINARY_CLOUD_NAME || !env.CLOUDINARY_API_KEY || !env.CLOUDINARY_API_SECRET) {
     reject(new Error("Cloudinary is not configured. Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET."));
     return;
   }
   const options: UploadApiOptions = {
-    folder: `${env.CLOUDINARY_FOLDER}/questions`,
+    folder: `${env.CLOUDINARY_FOLDER}/${subfolder}`,
     resource_type: "auto",
     use_filename: true,
     unique_filename: true,
