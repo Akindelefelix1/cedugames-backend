@@ -19,6 +19,8 @@ const EnvSchema = z.object({
   FLW_SECRET_KEY: z.string().default(""),
   FLW_SECRET_HASH: z.string().default(""),
   FLW_REDIRECT_URL: z.string().url().default("http://localhost:5173/shop"),
+  DATA_AND_AIRTIME_API_URL: z.string().default(""),
+  DATA_AND_AIRTIME_API_KEY: z.string().default(""),
   OPENAI_API_KEY: z.string().default(""),
   OPENAI_QUESTION_MODEL: z.string().min(1).default("gpt-5.6"),
   OPENAI_TIMEOUT_MS: z.coerce.number().int().min(5000).max(120000).default(60000),
