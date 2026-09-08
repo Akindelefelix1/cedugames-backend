@@ -6,9 +6,26 @@ import { recordCoinTransaction } from "./coin_service";
 const networks = new Set(["MTN", "AIRTEL", "GLO", "9MOBILE"]);
 
 function providerMessage(data: any, fallback: string) {
-  const value = data?.message ?? data?.error ?? data?.data?.message ?? data?.data?.error;
-  if (Array.isArray(value)) return value.map(String).join(", ") || fallback;
-  return typeof value === "string" && value.trim() ? value.trim() : fallback;
+  const messages: string[] = [];
+  const seen = new Set<unknown>();
+  const collect = (value: any, depth = 0) => {
+    if (value === null || value === undefined || depth > 5 || seen.has(value)) return;
+    if (typeof value === "string" || typeof value === "number") {
+      const text = String(value).trim();
+      if (text && text !== "[object Object]") messages.push(text);
+      return;
+    }
+    if (typeof value !== "object") return;
+    seen.add(value);
+    if (Array.isArray(value)) return value.forEach((item) => collect(item, depth + 1));
+    const preferred = ["message", "error", "detail", "description", "msg", "non_field_errors"];
+    preferred.forEach((key) => { if (key in value) collect(value[key], depth + 1); });
+    Object.entries(value).forEach(([key, child]) => {
+      if (!preferred.includes(key) && (Array.isArray(child) || (child && typeof child === "object"))) collect(child, depth + 1);
+    });
+  };
+  collect(data?.message ?? data?.error ?? data?.data?.message ?? data?.data?.error ?? data);
+  return [...new Set(messages)].join(", ") || fallback;
 }
 
 async function providerPurchase(body: Record<string, unknown>) {
