@@ -65,7 +65,7 @@ router.post("/admin/login", sensitiveLimiter, async (req, res) => {
 router.get("/admin/users", verifyAdminToken, async (_req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id,name,username,email,age,total_xp,coins_count,lives_remaining,is_verified,created_at
+      `SELECT id,name,username,email,age,profile_image_url,total_xp,coins_count,lives_remaining,is_verified,created_at
        FROM users WHERE role='user' ORDER BY created_at DESC`,
     );
     return res.json({ success: true, count: result.rowCount || 0, users: result.rows });
@@ -82,7 +82,7 @@ router.get("/admin/users/:id", verifyAdminToken, async (req, res) => {
   }
   try {
     const userResult = await pool.query(
-      `SELECT id,name,username,email,age,role,total_xp,coins_count,lives_remaining,
+      `SELECT id,name,username,email,age,role,profile_image_url,total_xp,coins_count,lives_remaining,
        is_verified,is_oauth,created_at,updated_at
        FROM users WHERE id=$1 AND role='user'`,
       [userId],
@@ -274,7 +274,7 @@ router.post("/admin/account/password", verifyAdminToken, async (req: Authenticat
 router.get("/user/profile", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
   try {
     const [userResult, performance, badges, attempts] = await Promise.all([
-      pool.query(`SELECT id,name,username,email,age,total_xp,coins_count,lives_remaining,is_verified,is_oauth,created_at,updated_at FROM users WHERE id=$1 AND role='user'`,[req.user!.id]),
+      pool.query(`SELECT id,name,username,email,age,profile_image_url,total_xp,coins_count,lives_remaining,is_verified,is_oauth,created_at,updated_at FROM users WHERE id=$1 AND role='user'`,[req.user!.id]),
       pool.query(`SELECT COUNT(a.id)::int attempts,COUNT(a.id) FILTER(WHERE a.passed)::int passed_attempts,
         COUNT(DISTINCT a.level_id) FILTER(WHERE a.passed)::int completed_levels,
         COALESCE(ROUND(AVG(a.score_percent)),0)::int average_score,COALESCE(MAX(a.score_percent),0)::int best_score,
@@ -304,7 +304,7 @@ router.patch("/user/profile", verifyPlayerToken, async (req: AuthenticatedReques
   const d=validation.data;
   try {
     const result=await pool.query(`UPDATE users SET name=$1,username=$2,age=$3,updated_at=NOW()
-      WHERE id=$4 AND role='user' RETURNING id,name,username,email,age,total_xp,coins_count,lives_remaining,is_verified,is_oauth,created_at,updated_at`,
+      WHERE id=$4 AND role='user' RETURNING id,name,username,email,age,profile_image_url,total_xp,coins_count,lives_remaining,is_verified,is_oauth,created_at,updated_at`,
       [d.name,d.username,d.age,req.user!.id]);
     await logActivity({eventType:"user.profile_updated",title:"Profile updated",description:`${d.name} updated their player profile`,actorId:req.user!.id,actorName:d.name});
     return res.json({success:true,message:"Profile updated successfully.",user:result.rows[0]});
@@ -319,7 +319,7 @@ const preferenceSchema = z.object({ ageGroupId: z.string().uuid(), categoryId: z
 router.get("/user/dashboard-bootstrap", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
   const [player, preferences, notifications] = await Promise.all([
     pool.query(
-      `SELECT u.id,u.name,u.username,u.email,u.coins_count,u.lives_remaining,
+      `SELECT u.id,u.name,u.username,u.email,u.profile_image_url,u.coins_count,u.lives_remaining,
               s.max_lives,s.passing_score_percent,s.refill_coin_cost
        FROM users u CROSS JOIN gameplay_settings s
        WHERE u.id=$1 AND s.id=1`,
@@ -347,6 +347,7 @@ router.get("/user/dashboard-bootstrap", verifyPlayerToken, async (req: Authentic
       name: player.rows[0].name,
       username: player.rows[0].username,
       email: player.rows[0].email,
+      profile_image_url: player.rows[0].profile_image_url,
     },
     wallet: {
       coins_count: player.rows[0].coins_count,
@@ -432,13 +433,13 @@ router.post("/login", sensitiveLimiter, async (req, res) => {
   if (!validation.success) return res.status(400).json({ success: false, errors: validation.error.issues });
   const email = normalizeEmail(validation.data.email);
   try {
-    const result = await pool.query("SELECT id,name,username,email,password,role,is_verified,token_version FROM users WHERE lower(email)=$1", [email]);
+    const result = await pool.query("SELECT id,name,username,email,password,role,is_verified,profile_image_url,token_version FROM users WHERE lower(email)=$1", [email]);
     const user = result.rows[0];
     const matches = user?.password ? await comparePassword(validation.data.password, user.password) : false;
     if (!matches) return res.status(401).json({ success: false, message: "Invalid email or password." });
     if (!user.is_verified) return res.status(403).json({ success: false, message: "Verify your email before signing in." });
     await logActivity({ eventType: "user.signed_in", title: "User signed in", description: `${user.name} signed in`, actorId: user.id, actorName: user.name });
-    return res.json({ success: true, message: "Sign in successful.", token: signSession(user), user: { id: user.id, name: user.name, username: user.username, email: user.email, role: user.role } });
+    return res.json({ success: true, message: "Sign in successful.", token: signSession(user), user: { id: user.id, name: user.name, username: user.username, email: user.email, role: user.role, profile_image_url: user.profile_image_url } });
   } catch (error) {
     console.error("Login failed", error);
     return res.status(500).json({ success: false, message: "Sign in could not be completed." });
@@ -459,7 +460,7 @@ router.post("/google", sensitiveLimiter, async (req, res, next) => {
     const result = await pool.query(
       `INSERT INTO users(name,username,email,role,is_oauth,is_verified) VALUES($1,$2,$3,'user',true,true)
        ON CONFLICT((lower(email))) DO UPDATE SET name=EXCLUDED.name,is_oauth=true,is_verified=true,updated_at=NOW()
-       RETURNING id,name,username,email,role,token_version`,
+       RETURNING id,name,username,email,role,profile_image_url,token_version`,
       [payload.name || base, username, email],
     );
     const user = result.rows[0];
