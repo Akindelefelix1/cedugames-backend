@@ -10,6 +10,7 @@ import { destroyMediaQuietly, StoredMedia, uploadMedia } from "../services/cloud
 
 const router = Router();
 const allowedMimeTypes: Record<string, string> = {
+  "text/csv": ".csv", "application/csv": ".csv", "application/vnd.ms-excel": ".csv",
   "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp",
   "audio/mpeg": ".mp3", "audio/wav": ".wav", "audio/ogg": ".ogg",
   "video/mp4": ".mp4", "video/webm": ".webm",
