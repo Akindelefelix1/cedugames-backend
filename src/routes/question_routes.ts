@@ -31,6 +31,12 @@ const bodySchema = z.object({
   questionMediaType: z.enum(["", "image", "audio", "video", "document"]).default(""),
   options: z.string().transform((value, ctx) => { try { return z.array(optionSchema).length(4).parse(JSON.parse(value)); } catch { ctx.addIssue({ code: "custom", message: "Four valid options are required." }); return z.NEVER; } }),
 });
+const bulkHeaderNames = ["Questions", "Option A", "Option B", "Option C", "Option D", "Correct Answer"] as const;
+const bulkQuestionSchema = z.object({
+  question: z.string().trim().min(1).max(500),
+  options: z.array(z.string().trim().min(1).max(180)).length(4),
+  correctAnswer: z.number().int().min(0).max(3),
+});
 const storeFiles = async (fileMap: Record<string, Express.Multer.File[]>) => {
   const entries = await Promise.all(Object.entries(fileMap).map(async ([field, files]) => [field, await Promise.all(files.map((file) => uploadMedia(file)))] as const));
   return Object.fromEntries(entries) as Record<string, StoredMedia[]>;
@@ -43,6 +49,85 @@ const generationSchema = z.object({
   ageGroupId: z.string().uuid(), categoryId: z.string().uuid(), levelId: z.string().uuid(),
   count: z.number().int().min(1).max(20).default(5),
   guidance: z.string().trim().max(2000).default(""),
+});
+
+const parseCsv = (source: string) => {
+  const rows: string[][] = [];
+  let row: string[] = [], cell = "", quoted = false;
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    if (character === '"') {
+      if (quoted && source[index + 1] === '"') { cell += '"'; index += 1; }
+      else quoted = !quoted;
+    } else if (character === "," && !quoted) { row.push(cell.trim()); cell = ""; }
+    else if ((character === "\n" || character === "\r") && !quoted) {
+      if (character === "\r" && source[index + 1] === "\n") index += 1;
+      row.push(cell.trim()); cell = "";
+      if (row.some((value) => value)) rows.push(row);
+      row = [];
+    } else cell += character;
+  }
+  if (cell || row.length) { row.push(cell.trim()); if (row.some((value) => value)) rows.push(row); }
+  return rows;
+};
+
+const parseBulkQuestions = (source: string) => {
+  const rows = parseCsv(source).map((row) => row.map((value) => value.replace(/^\uFEFF/, "")));
+  if (!rows.length) return { errors: ["The CSV file is empty."], questions: [] };
+  const headers = rows[0]!.map((value) => value.trim().toLowerCase());
+  const expected = bulkHeaderNames.map((value) => value.toLowerCase());
+  if (headers.length !== expected.length || headers.some((value, index) => value !== expected[index])) {
+    return { errors: [`The CSV headers must be: ${bulkHeaderNames.join(", ")}.`], questions: [] };
+  }
+  const errors: string[] = [];
+  const questions = rows.slice(1).map((row, index) => {
+    const line = index + 2;
+    if (row.length !== 6) { errors.push(`Row ${line} must contain exactly six columns.`); return null; }
+    const correct = row[5]!.trim().toLowerCase().replace(/\s+/g, " ");
+    const correctIndex = ["option a", "option b", "option c", "option d"].indexOf(correct);
+    if (correctIndex < 0) { errors.push(`Row ${line} has an invalid Correct Answer. Use Option A, Option B, Option C, or Option D.`); return null; }
+    const parsed = bulkQuestionSchema.safeParse({ question: row[0], options: row.slice(1, 5), correctAnswer: correctIndex });
+    if (!parsed.success) { errors.push(`Row ${line} has a missing or overly long question/option.`); return null; }
+    return parsed.data;
+  }).filter(Boolean) as Array<z.infer<typeof bulkQuestionSchema>>;
+  if (!questions.length && !errors.length) errors.push("The CSV contains no question rows.");
+  return { errors, questions };
+};
+
+router.post("/admin/questions/bulk", verifyAdminToken, upload.single("file"), async (req, res) => {
+  const placement = z.object({
+    ageGroupId: z.string().uuid(), categoryId: z.string().uuid(), levelId: z.string().uuid(),
+    status: z.enum(["draft", "published"]).default("published"),
+  }).safeParse(req.body);
+  if (!placement.success) return res.status(400).json({ success: false, message: "Select a valid age group, category, and level." });
+  if (!req.file) return res.status(400).json({ success: false, message: "Choose a CSV file to upload." });
+  const parsed = parseBulkQuestions(req.file.buffer.toString("utf8"));
+  if (parsed.errors.length) return res.status(400).json({ success: false, errors: parsed.errors });
+  const hierarchy = await pool.query("SELECT 1 FROM game_levels l JOIN game_categories c ON c.id=l.category_id WHERE l.id=$1 AND c.id=$2 AND c.age_group_id=$3", [placement.data.levelId, placement.data.categoryId, placement.data.ageGroupId]);
+  if (!hierarchy.rowCount) return res.status(400).json({ success: false, message: "The selected age group, category, and level do not match." });
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    for (const question of parsed.questions) {
+      const inserted = await client.query(
+        `INSERT INTO questions(age_group_id,category_id,level_id,question_text,explanation,status,read_aloud)
+         VALUES($1,$2,$3,$4,'',$5,false) RETURNING id`,
+        [placement.data.ageGroupId, placement.data.categoryId, placement.data.levelId, question.question, placement.data.status],
+      );
+      for (let index = 0; index < question.options.length; index += 1) {
+        await client.query(
+          `INSERT INTO question_options(question_id,option_order,option_text,is_correct) VALUES($1,$2,$3,$4)`,
+          [inserted.rows[0].id, index, question.options[index], index === question.correctAnswer],
+        );
+      }
+    }
+    await client.query("COMMIT");
+    await logActivity({ eventType: "content.questions_bulk_created", title: "Questions uploaded in bulk", description: `${parsed.questions.length} questions were uploaded` });
+    return res.status(201).json({ success: true, count: parsed.questions.length, message: `${parsed.questions.length} questions uploaded successfully.` });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally { client.release(); }
 });
 
 router.post("/admin/questions/ai/generate", verifyAdminToken, async (req, res) => {
