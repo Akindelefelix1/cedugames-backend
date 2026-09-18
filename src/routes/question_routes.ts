@@ -103,15 +103,22 @@ router.post("/admin/questions/bulk", verifyAdminToken, upload.single("file"), as
   if (!req.file) return res.status(400).json({ success: false, message: "Choose a CSV file to upload." });
   const parsed = parseBulkQuestions(req.file.buffer.toString("utf8"));
   if (parsed.errors.length) return res.status(400).json({ success: false, errors: parsed.errors });
-  const hierarchy = await pool.query("SELECT 1 FROM game_levels l JOIN game_categories c ON c.id=l.category_id WHERE l.id=$1 AND c.id=$2 AND c.age_group_id=$3", [placement.data.levelId, placement.data.categoryId, placement.data.ageGroupId]);
+  let hierarchy;
+  try {
+    hierarchy = await pool.query("SELECT 1 FROM game_levels l JOIN game_categories c ON c.id=l.category_id WHERE l.id=$1 AND c.id=$2 AND c.age_group_id=$3", [placement.data.levelId, placement.data.categoryId, placement.data.ageGroupId]);
+  } catch (error: any) {
+    console.error("Bulk question placement lookup failed", error);
+    if (["42P01", "42703"].includes(error?.code)) return res.status(503).json({ success: false, message: "The backend database is missing the question tables or columns. Run npm run migrate, then redeploy the backend." });
+    throw error;
+  }
   if (!hierarchy.rowCount) return res.status(400).json({ success: false, message: "The selected age group, category, and level do not match." });
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
     for (const question of parsed.questions) {
       const inserted = await client.query(
-        `INSERT INTO questions(age_group_id,category_id,level_id,question_text,explanation,status,read_aloud)
-         VALUES($1,$2,$3,$4,'',$5,false) RETURNING id`,
+        `INSERT INTO questions(age_group_id,category_id,level_id,question_text,explanation,status)
+         VALUES($1,$2,$3,$4,'',$5) RETURNING id`,
         [placement.data.ageGroupId, placement.data.categoryId, placement.data.levelId, question.question, placement.data.status],
       );
       for (let index = 0; index < question.options.length; index += 1) {
@@ -124,8 +131,10 @@ router.post("/admin/questions/bulk", verifyAdminToken, upload.single("file"), as
     await client.query("COMMIT");
     await logActivity({ eventType: "content.questions_bulk_created", title: "Questions uploaded in bulk", description: `${parsed.questions.length} questions were uploaded` });
     return res.status(201).json({ success: true, count: parsed.questions.length, message: `${parsed.questions.length} questions uploaded successfully.` });
-  } catch (error) {
+  } catch (error: any) {
     await client.query("ROLLBACK");
+    console.error("Bulk question upload failed", error);
+    if (["42P01", "42703"].includes(error?.code)) return res.status(503).json({ success: false, message: "The backend database is missing the question tables or columns. Run npm run migrate, then redeploy the backend." });
     throw error;
   } finally { client.release(); }
 });
