@@ -9,6 +9,14 @@
 5. Set `CORS_ORIGINS` to comma-separated production frontend origins.
 6. Point `cedu-api.cephasict.com` to the Contabo server, terminate HTTPS with a valid certificate, and reverse-proxy it to the application `PORT`.
 7. Set the admin build variable `REACT_APP_BASE_URL=https://cedu-api.cephasict.com` and the user build variable `VITE_API_URL=https://cedu-api.cephasict.com` before building the frontends.
+	For Render staging use `https://cedugames-admin.onrender.com,https://cedugames-user.onrender.com`.
+
+## Branch deployment contract
+
+- `staging` deploys the backend and both frontends to Render.
+- `main` deploys the backend and both frontends to Contabo.
+- Set the frontend API URL at build time: `REACT_APP_BASE_URL` for the admin app and `VITE_API_URL` for the users app. Render uses `https://cedugames-backend.onrender.com`; Contabo uses `https://cedu-api.cephasict.com`.
+- Set `CORS_ORIGINS` on each backend deployment to the exact browser origins for that environment.
 
 ## Release commands
 

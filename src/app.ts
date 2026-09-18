@@ -22,7 +22,8 @@ app.use((req, res, next) => {
 app.use(helmet());
 app.use(cors({
   origin(origin, callback) {
-    if (!origin || env.corsOrigins.includes(origin)) return callback(null, true);
+    const normalizedOrigin = origin?.replace(/\/+$/, "");
+    if (!normalizedOrigin || env.corsOrigins.includes(normalizedOrigin)) return callback(null, true);
     return callback(new Error("Origin is not allowed by CORS"));
   },
   credentials: true,

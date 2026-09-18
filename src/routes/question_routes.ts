@@ -10,6 +10,7 @@ import { destroyMediaQuietly, StoredMedia, uploadMedia } from "../services/cloud
 
 const router = Router();
 const allowedMimeTypes: Record<string, string> = {
+  "text/csv": ".csv", "application/csv": ".csv", "application/vnd.ms-excel": ".csv",
   "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp",
   "audio/mpeg": ".mp3", "audio/wav": ".wav", "audio/ogg": ".ogg",
   "video/mp4": ".mp4", "video/webm": ".webm",
@@ -27,8 +28,15 @@ const bodySchema = z.object({
   questionText: z.string().trim().max(10000).default(""), explanation: z.string().trim().max(5000).default(""), shape: z.string().default("null").transform((value, ctx) => { try { return shapeSchema.parse(JSON.parse(value)); } catch { ctx.addIssue({ code: "custom", message: "Invalid question shape." }); return z.NEVER; } }),
   ageGroupId: z.string().uuid(), categoryId: z.string().uuid(), levelId: z.string().uuid(),
   status: z.enum(["draft", "published"]).default("published"),
+  readAloud: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),
   questionMediaType: z.enum(["", "image", "audio", "video", "document"]).default(""),
   options: z.string().transform((value, ctx) => { try { return z.array(optionSchema).length(4).parse(JSON.parse(value)); } catch { ctx.addIssue({ code: "custom", message: "Four valid options are required." }); return z.NEVER; } }),
+});
+const bulkHeaderNames = ["Questions", "Option A", "Option B", "Option C", "Option D", "Correct Answer"] as const;
+const bulkQuestionSchema = z.object({
+  question: z.string().trim().min(1).max(500),
+  options: z.array(z.string().trim().min(1).max(180)).length(4),
+  correctAnswer: z.number().int().min(0).max(3),
 });
 const storeFiles = async (fileMap: Record<string, Express.Multer.File[]>) => {
   const entries = await Promise.all(Object.entries(fileMap).map(async ([field, files]) => [field, await Promise.all(files.map((file) => uploadMedia(file)))] as const));
@@ -42,6 +50,94 @@ const generationSchema = z.object({
   ageGroupId: z.string().uuid(), categoryId: z.string().uuid(), levelId: z.string().uuid(),
   count: z.number().int().min(1).max(20).default(5),
   guidance: z.string().trim().max(2000).default(""),
+});
+
+const parseCsv = (source: string) => {
+  const rows: string[][] = [];
+  let row: string[] = [], cell = "", quoted = false;
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    if (character === '"') {
+      if (quoted && source[index + 1] === '"') { cell += '"'; index += 1; }
+      else quoted = !quoted;
+    } else if (character === "," && !quoted) { row.push(cell.trim()); cell = ""; }
+    else if ((character === "\n" || character === "\r") && !quoted) {
+      if (character === "\r" && source[index + 1] === "\n") index += 1;
+      row.push(cell.trim()); cell = "";
+      if (row.some((value) => value)) rows.push(row);
+      row = [];
+    } else cell += character;
+  }
+  if (cell || row.length) { row.push(cell.trim()); if (row.some((value) => value)) rows.push(row); }
+  return rows;
+};
+
+const parseBulkQuestions = (source: string) => {
+  const rows = parseCsv(source).map((row) => row.map((value) => value.replace(/^\uFEFF/, "")));
+  if (!rows.length) return { errors: ["The CSV file is empty."], questions: [] };
+  const headers = rows[0]!.map((value) => value.trim().toLowerCase());
+  const expected = bulkHeaderNames.map((value) => value.toLowerCase());
+  if (headers.length !== expected.length || headers.some((value, index) => value !== expected[index])) {
+    return { errors: [`The CSV headers must be: ${bulkHeaderNames.join(", ")}.`], questions: [] };
+  }
+  const errors: string[] = [];
+  const questions = rows.slice(1).map((row, index) => {
+    const line = index + 2;
+    if (row.length !== 6) { errors.push(`Row ${line} must contain exactly six columns.`); return null; }
+    const correct = row[5]!.trim().toLowerCase().replace(/\s+/g, " ");
+    const correctIndex = ["option a", "option b", "option c", "option d"].indexOf(correct);
+    if (correctIndex < 0) { errors.push(`Row ${line} has an invalid Correct Answer. Use Option A, Option B, Option C, or Option D.`); return null; }
+    const parsed = bulkQuestionSchema.safeParse({ question: row[0], options: row.slice(1, 5), correctAnswer: correctIndex });
+    if (!parsed.success) { errors.push(`Row ${line} has a missing or overly long question/option.`); return null; }
+    return parsed.data;
+  }).filter(Boolean) as Array<z.infer<typeof bulkQuestionSchema>>;
+  if (!questions.length && !errors.length) errors.push("The CSV contains no question rows.");
+  return { errors, questions };
+};
+
+router.post("/admin/questions/bulk", verifyAdminToken, upload.single("file"), async (req, res) => {
+  const placement = z.object({
+    ageGroupId: z.string().uuid(), categoryId: z.string().uuid(), levelId: z.string().uuid(),
+    status: z.enum(["draft", "published"]).default("published"),
+  }).safeParse(req.body);
+  if (!placement.success) return res.status(400).json({ success: false, message: "Select a valid age group, category, and level." });
+  if (!req.file) return res.status(400).json({ success: false, message: "Choose a CSV file to upload." });
+  const parsed = parseBulkQuestions(req.file.buffer.toString("utf8"));
+  if (parsed.errors.length) return res.status(400).json({ success: false, errors: parsed.errors });
+  let hierarchy;
+  try {
+    hierarchy = await pool.query("SELECT 1 FROM game_levels l JOIN game_categories c ON c.id=l.category_id WHERE l.id=$1 AND c.id=$2 AND c.age_group_id=$3", [placement.data.levelId, placement.data.categoryId, placement.data.ageGroupId]);
+  } catch (error: any) {
+    console.error("Bulk question placement lookup failed", error);
+    if (["42P01", "42703"].includes(error?.code)) return res.status(503).json({ success: false, message: "The backend database is missing the question tables or columns. Run npm run migrate, then redeploy the backend." });
+    throw error;
+  }
+  if (!hierarchy.rowCount) return res.status(400).json({ success: false, message: "The selected age group, category, and level do not match." });
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    for (const question of parsed.questions) {
+      const inserted = await client.query(
+        `INSERT INTO questions(age_group_id,category_id,level_id,question_text,explanation,status)
+         VALUES($1,$2,$3,$4,'',$5) RETURNING id`,
+        [placement.data.ageGroupId, placement.data.categoryId, placement.data.levelId, question.question, placement.data.status],
+      );
+      for (let index = 0; index < question.options.length; index += 1) {
+        await client.query(
+          `INSERT INTO question_options(question_id,option_order,option_text,is_correct) VALUES($1,$2,$3,$4)`,
+          [inserted.rows[0].id, index, question.options[index], index === question.correctAnswer],
+        );
+      }
+    }
+    await client.query("COMMIT");
+    await logActivity({ eventType: "content.questions_bulk_created", title: "Questions uploaded in bulk", description: `${parsed.questions.length} questions were uploaded` });
+    return res.status(201).json({ success: true, count: parsed.questions.length, message: `${parsed.questions.length} questions uploaded successfully.` });
+  } catch (error: any) {
+    await client.query("ROLLBACK");
+    console.error("Bulk question upload failed", error);
+    if (["42P01", "42703"].includes(error?.code)) return res.status(503).json({ success: false, message: "The backend database is missing the question tables or columns. Run npm run migrate, then redeploy the backend." });
+    throw error;
+  } finally { client.release(); }
 });
 
 router.post("/admin/questions/ai/generate", verifyAdminToken, async (req, res) => {
@@ -90,7 +186,7 @@ router.post("/admin/questions", verifyAdminToken, upload.fields(fields), async (
     const hierarchy = await client.query(`SELECT 1 FROM game_levels l JOIN game_categories c ON c.id=l.category_id WHERE l.id=$1 AND c.id=$2 AND c.age_group_id=$3`, [data.levelId, data.categoryId, data.ageGroupId]);
     if (!hierarchy.rowCount) { await client.query("ROLLBACK"); return res.status(400).json({ success: false, message: "The selected age group, category, and level do not match." }); }
     cloudFiles = await storeFiles(fileMap);
-    const inserted = await client.query(`INSERT INTO questions(age_group_id,category_id,level_id,question_text,explanation,media_url,media_type,status,shape_type,shape_color) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`, [data.ageGroupId, data.categoryId, data.levelId, questionText, data.explanation, storedMedia(cloudFiles, "questionMedia")?.url || null, questionFile ? data.questionMediaType : null, data.status, data.shape?.type || null, data.shape?.color || null]);
+    const inserted = await client.query(`INSERT INTO questions(age_group_id,category_id,level_id,question_text,explanation,media_url,media_type,status,read_aloud,shape_type,shape_color) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`, [data.ageGroupId, data.categoryId, data.levelId, questionText, data.explanation, storedMedia(cloudFiles, "questionMedia")?.url || null, questionFile ? data.questionMediaType : null, data.status, data.readAloud, data.shape?.type || null, data.shape?.color || null]);
     for (let index = 0; index < data.options.length; index += 1) {
       const option = data.options[index]!; const file = fileMap[`optionMedia${index}`]?.[0];
       await client.query(`INSERT INTO question_options(question_id,option_order,option_text,media_url,media_type,is_correct,shape_type,shape_color) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, [inserted.rows[0].id, index, optionTexts[index], storedMedia(cloudFiles, `optionMedia${index}`)?.url || null, file ? option.mediaType : null, option.isCorrect, option.shape?.type || null, option.shape?.color || null]);
@@ -111,7 +207,7 @@ router.get("/admin/questions/:id", verifyAdminToken, async (req, res) => {
   const result = await pool.query(`SELECT q.*,COALESCE(json_agg(json_build_object('id',o.id,'text',o.option_text,'mediaUrl',o.media_url,'mediaType',o.media_type,'isCorrect',o.is_correct,'shapeType',o.shape_type,'shapeColor',o.shape_color) ORDER BY o.option_order) FILTER (WHERE o.id IS NOT NULL),'[]') options FROM questions q LEFT JOIN question_options o ON o.question_id=q.id WHERE q.id=$1 GROUP BY q.id`, [req.params.id]);
   const row = result.rows[0];
   if (!row) return res.status(404).json({ success: false, message: "Question not found." });
-  return res.json({ success: true, question: { id: row.id, ageGroupId: row.age_group_id, categoryId: row.category_id, levelId: row.level_id, text: row.question_text, explanation: row.explanation, mediaUrl: row.media_url, mediaType: row.media_type, shapeType: row.shape_type, shapeColor: row.shape_color, status: row.status, options: row.options } });
+  return res.json({ success: true, question: { id: row.id, ageGroupId: row.age_group_id, categoryId: row.category_id, levelId: row.level_id, text: row.question_text, explanation: row.explanation, mediaUrl: row.media_url, mediaType: row.media_type, readAloud: row.read_aloud, shapeType: row.shape_type, shapeColor: row.shape_color, status: row.status, options: row.options } });
 });
 
 router.put("/admin/questions/:id", verifyAdminToken, upload.fields(fields), async (req, res) => {
@@ -139,7 +235,7 @@ router.put("/admin/questions/:id", verifyAdminToken, upload.fields(fields), asyn
     const questionMediaType = questionFile ? data.questionMediaType : removeMedia.has("question") ? null : current.rows[0].media_type;
     if (!plainText(questionText) && !questionMediaUrl && !data.shape) { await client.query("ROLLBACK"); await cleanupStored(cloudFiles); return res.status(400).json({ success: false, message: "Question text, media, or a shape is required." }); }
     if (data.options.filter((option) => option.isCorrect).length !== 1) { await client.query("ROLLBACK"); await cleanupStored(cloudFiles); return res.status(400).json({ success: false, message: "Exactly one option must be correct." }); }
-    await client.query(`UPDATE questions SET age_group_id=$1,category_id=$2,level_id=$3,question_text=$4,explanation=$5,media_url=$6,media_type=$7,status=$8,shape_type=$9,shape_color=$10,updated_at=NOW() WHERE id=$11`, [data.ageGroupId,data.categoryId,data.levelId,questionText,data.explanation,questionMediaUrl,questionMediaType,data.status,data.shape?.type||null,data.shape?.color||null,req.params.id]);
+    await client.query(`UPDATE questions SET age_group_id=$1,category_id=$2,level_id=$3,question_text=$4,explanation=$5,media_url=$6,media_type=$7,status=$8,read_aloud=$9,shape_type=$10,shape_color=$11,updated_at=NOW() WHERE id=$12`, [data.ageGroupId,data.categoryId,data.levelId,questionText,data.explanation,questionMediaUrl,questionMediaType,data.status,data.readAloud,data.shape?.type||null,data.shape?.color||null,req.params.id]);
     for (let index = 0; index < 4; index += 1) {
       const option = data.options[index]!; const file = fileMap[`optionMedia${index}`]?.[0]; const existing = current.rows[0].options[index] || {};
       const optionMediaUrl = file ? storedMedia(cloudFiles, `optionMedia${index}`)?.url : removeMedia.has(`option${index}`) ? null : existing.mediaUrl;
@@ -178,8 +274,8 @@ router.get("/admin/levels/:levelId/questions", verifyAdminToken, async (req, res
 });
 
 router.get("/catalog/levels/:levelId/questions", async (req, res) => {
-  const result = await pool.query(`SELECT q.id,q.question_text,q.explanation,q.media_url,q.media_type,q.shape_type,q.shape_color,l.points_per_question,l.time_limit_seconds,COALESCE(json_agg(json_build_object('id',o.id,'text',o.option_text,'mediaUrl',o.media_url,'mediaType',o.media_type,'isCorrect',o.is_correct,'shapeType',o.shape_type,'shapeColor',o.shape_color) ORDER BY o.option_order) FILTER (WHERE o.id IS NOT NULL),'[]') options FROM questions q JOIN game_levels l ON l.id=q.level_id LEFT JOIN question_options o ON o.question_id=q.id WHERE q.level_id=$1 AND q.status='published' GROUP BY q.id,l.points_per_question,l.time_limit_seconds ORDER BY random()`, [req.params.levelId]);
-  res.json({ success: true, questions: result.rows.map((row: Record<string, any>) => ({ id: row.id, text: row.question_text, explanation: row.explanation, mediaUrl: row.media_url, mediaType: row.media_type, shapeType: row.shape_type, shapeColor: row.shape_color, points: row.points_per_question, timeLimit: row.time_limit_seconds, options: row.options.map(({ isCorrect: _hidden, ...option }: Record<string, unknown>) => option) })) });
+  const result = await pool.query(`SELECT q.id,q.question_text,q.explanation,q.media_url,q.media_type,q.read_aloud,q.shape_type,q.shape_color,l.points_per_question,l.time_limit_seconds,COALESCE(json_agg(json_build_object('id',o.id,'text',o.option_text,'mediaUrl',o.media_url,'mediaType',o.media_type,'isCorrect',o.is_correct,'shapeType',o.shape_type,'shapeColor',o.shape_color) ORDER BY o.option_order) FILTER (WHERE o.id IS NOT NULL),'[]') options FROM questions q JOIN game_levels l ON l.id=q.level_id LEFT JOIN question_options o ON o.question_id=q.id WHERE q.level_id=$1 AND q.status='published' GROUP BY q.id,l.points_per_question,l.time_limit_seconds ORDER BY random()`, [req.params.levelId]);
+  res.json({ success: true, questions: result.rows.map((row: Record<string, any>) => ({ id: row.id, text: row.question_text, explanation: row.explanation, mediaUrl: row.media_url, mediaType: row.media_type, readAloud: row.read_aloud, shapeType: row.shape_type, shapeColor: row.shape_color, points: row.points_per_question, timeLimit: row.time_limit_seconds, options: row.options.map(({ isCorrect: _hidden, ...option }: Record<string, unknown>) => option) })) });
 });
 
 export default router;

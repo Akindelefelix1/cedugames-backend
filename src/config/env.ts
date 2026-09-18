@@ -13,7 +13,7 @@ const EnvSchema = z.object({
   ZOHO_MAIL_FROM_NAME: z.string().min(1).default("CeduGames"),
   MAIL_SEND_TIMEOUT_MS: z.coerce.number().int().min(1000).max(120000).default(10000),
   EMAIL_VERIFICATION_ENABLED: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),
-  CORS_ORIGINS: z.string().default("http://localhost:3000,http://localhost:5173"),
+  CORS_ORIGINS: z.string().default("http://localhost:3000,http://localhost:5173,https://cedugames-admin.onrender.com,https://cedugames-user.onrender.com"),
   SUPER_ADMIN_EMAIL: z.string().email().default("cedugames@gmail.com"),
   SUPER_ADMIN_PASSWORD: z.string().min(10).default("Admin@1234"),
   FLW_SECRET_KEY: z.string().default(""),
@@ -50,5 +50,7 @@ if (parsed.data.NODE_ENV === "production") {
 
 export const env = {
   ...parsed.data,
-  corsOrigins: parsed.data.CORS_ORIGINS.split(",").map((value) => value.trim()).filter(Boolean),
+  corsOrigins: parsed.data.CORS_ORIGINS.split(",")
+    .map((value) => value.trim().replace(/\/+$/, ""))
+    .filter(Boolean),
 };
