@@ -177,7 +177,7 @@ router.get("/admin/activities", verifyAdminToken, async (req, res) => {
   }
 });
 
-const adminPermissions = ["dashboard","user-management","content","leaderboard","coin-system","daily-rewards","categories","notifications","settings","admins"] as const;
+const adminPermissions = ["dashboard","user-management","content","leaderboard","coin-system","airtime","daily-rewards","categories","notifications","settings","admins"] as const;
 const createAdminSchema = z.object({
   name: z.string().trim().min(2).max(120), email: z.string().trim().email(),
   password: z.string().min(10).max(128), title: z.string().trim().min(2).max(80),
