@@ -5,6 +5,7 @@ const RegisterUserSchema = z.object({
   name: z.string().min(2),
   username: z.string().min(3),
   email: z.string().email(),
+  phone: z.string().trim().min(7).max(20),
   password: z.string().min(10).max(128),
   age: z.number().int().positive(),
 });
@@ -12,12 +13,15 @@ const RegisterUserSchema = z.object({
 export type RegisterUserInput = z.infer<typeof RegisterUserSchema>;
 
 //Login Zod Schema
-const LoginSchema = z.object({
+const UserLoginSchema = z.object({
+  identifier: z.string().trim().min(3).max(320),
+  password: z.string().min(10).max(128),
+});
+const AdminLoginSchema = z.object({
   email: z.string().email(),
   password: z.string().min(10).max(128),
 });
-const AdminLoginSchema = LoginSchema;
-export type LoginInput = z.infer<typeof LoginSchema>;
+export type LoginInput = z.infer<typeof UserLoginSchema>;
 
 // Google Authentication Zod Schema
 const GoogleAuthSchema = z.object({
@@ -65,7 +69,7 @@ const UpdateProfileSchema = z.object({
 
 export {
   RegisterUserSchema,
-  LoginSchema,
+  UserLoginSchema,
   AdminLoginSchema,
   GoogleAuthSchema,
   ForgotPasswordSchema,

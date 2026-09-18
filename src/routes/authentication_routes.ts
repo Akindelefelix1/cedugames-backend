@@ -12,7 +12,7 @@ import { generateOtp, hashOtp } from "../helpers/otp";
 import { logActivity } from "../helpers/activityLog";
 import { verifyAdminToken, verifyPlayerToken, type AuthenticatedRequest } from "../middlewares/authentication_middleware";
 import {
-  AdminLoginSchema, ForgotPasswordSchema, GoogleAuthSchema, LoginSchema, RegisterUserSchema,
+  AdminLoginSchema, ForgotPasswordSchema, GoogleAuthSchema, UserLoginSchema, RegisterUserSchema,
   ResendOtpSchema, ResetPasswordSchema, UpdatePassword, VerifyOtpSchema,
   UpdateProfileSchema,
 } from "../schemas/authentication_schema";
@@ -25,6 +25,7 @@ const sensitiveLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 8, standardHe
 router.use(authLimiter);
 
 const normalizeEmail = (email: string) => email.trim().toLowerCase();
+const normalizePhone = (phone: string) => phone.trim().replace(/[\s().-]/g, "");
 const signSession = (user: { id: string; role: string; token_version: number }) =>
   jwt.sign({ id: user.id, role: user.role, ver: user.token_version }, env.JWT_SECRET, {
     expiresIn: "24h", issuer: "cedugames-api", audience: "cedugames-client",
@@ -384,6 +385,8 @@ router.post("/user/register", sensitiveLimiter, async (req, res) => {
   if (!validation.success) return res.status(400).json({ success: false, errors: validation.error.issues });
   const { name, password, age } = validation.data;
   const email = normalizeEmail(validation.data.email);
+  const phone = normalizePhone(validation.data.phone);
+  if (!/^\+?[1-9]\d{6,14}$/.test(phone)) return res.status(400).json({ success: false, message: "Enter a valid phone number with country code." });
   const username = validation.data.username.trim().toLowerCase();
   const otp = generateOtp();
   const client = await pool.connect();
@@ -391,9 +394,9 @@ router.post("/user/register", sensitiveLimiter, async (req, res) => {
     await client.query("BEGIN");
     const hashedPassword = await hashPassword(password);
     const user = await client.query(
-      `INSERT INTO users (name, username, email, password, age, is_verified)
-       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id,name,username,email,role,is_verified`,
-      [name.trim(), username, email, hashedPassword, age, !env.EMAIL_VERIFICATION_ENABLED],
+      `INSERT INTO users (name, username, email, phone, password, age, is_verified)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id,name,username,email,phone,role,is_verified`,
+      [name.trim(), username, email, phone, hashedPassword, age, !env.EMAIL_VERIFICATION_ENABLED],
     );
     if (env.EMAIL_VERIFICATION_ENABLED) {
       await client.query(
@@ -422,24 +425,26 @@ router.post("/user/register", sensitiveLimiter, async (req, res) => {
     });
   } catch (error: any) {
     await client.query("ROLLBACK");
-    if (error?.code === "23505") return res.status(409).json({ success: false, message: "Email or username is already registered." });
+    if (error?.code === "23505") return res.status(409).json({ success: false, message: "Email, phone number, or username is already registered." });
     console.error("Registration failed", error);
     return res.status(500).json({ success: false, message: "Registration could not be completed." });
   } finally { client.release(); }
 });
 
 router.post("/login", sensitiveLimiter, async (req, res) => {
-  const validation = LoginSchema.safeParse(req.body);
+  const validation = UserLoginSchema.safeParse(req.body);
   if (!validation.success) return res.status(400).json({ success: false, errors: validation.error.issues });
-  const email = normalizeEmail(validation.data.email);
+  const identifier = validation.data.identifier.trim();
+  const email = normalizeEmail(identifier);
+  const phone = normalizePhone(identifier);
   try {
-    const result = await pool.query("SELECT id,name,username,email,password,role,is_verified,profile_image_url,token_version FROM users WHERE lower(email)=$1", [email]);
+    const result = await pool.query("SELECT id,name,username,email,phone,password,role,is_verified,profile_image_url,token_version FROM users WHERE lower(email)=$1 OR phone=$2 LIMIT 1", [email, phone]);
     const user = result.rows[0];
     const matches = user?.password ? await comparePassword(validation.data.password, user.password) : false;
-    if (!matches) return res.status(401).json({ success: false, message: "Invalid email or password." });
+    if (!matches) return res.status(401).json({ success: false, message: "Invalid email or phone number or password." });
     if (!user.is_verified) return res.status(403).json({ success: false, message: "Verify your email before signing in." });
     await logActivity({ eventType: "user.signed_in", title: "User signed in", description: `${user.name} signed in`, actorId: user.id, actorName: user.name });
-    return res.json({ success: true, message: "Sign in successful.", token: signSession(user), user: { id: user.id, name: user.name, username: user.username, email: user.email, role: user.role, profile_image_url: user.profile_image_url } });
+    return res.json({ success: true, message: "Sign in successful.", token: signSession(user), user: { id: user.id, name: user.name, username: user.username, email: user.email, phone: user.phone, role: user.role, profile_image_url: user.profile_image_url } });
   } catch (error) {
     console.error("Login failed", error);
     return res.status(500).json({ success: false, message: "Sign in could not be completed." });
