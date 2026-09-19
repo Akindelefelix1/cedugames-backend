@@ -30,4 +30,18 @@ router.post("/gameplay/attempts",async(req:AuthenticatedRequest,res)=>{const par
  const answerMap=new Map(d.answers.map(a=>[a.questionId,a.optionId]));const correct=questions.reduce((n:number,q:{question_id:string;option_id:string})=>n+(answerMap.get(q.question_id)===q.option_id?1:0),0);const total=questions.length;const score=Math.round(correct*100/total);const passed=score>=Number(settings.passing_score_percent);let lives=Number(user.lives_remaining),balance=Number(user.coins_count),refilled=false,needsPurchase=false,refillTransactionId=null;if(!passed){lives=Math.max(0,lives-1);if(lives===0){const cost=Number(settings.refill_coin_cost);if(balance>=cost){const tx=await recordCoinTransaction({userId:req.user!.id,type:"deduction",amount:cost,description:`Automatic refill to ${settings.max_lives} lives after a failed level`,reference:`life-refill:${d.attemptId}`,metadata:{levelId:d.levelId,attemptId:d.attemptId}},client);refillTransactionId=tx.id;balance=Number(tx.balance_after);lives=Number(settings.max_lives);refilled=true;}else needsPurchase=true;}await client.query("UPDATE users SET lives_remaining=$1,updated_at=NOW() WHERE id=$2",[lives,req.user!.id]);}
  const xpEarned=Math.max(0,correct-Number(bestResult.rows[0].best))*Number(levelResult.rows[0].points_per_question);const totalXp=Number(user.total_xp)+xpEarned;if(xpEarned>0)await client.query("UPDATE users SET total_xp=$1,updated_at=NOW() WHERE id=$2",[totalXp,req.user!.id]);const result={attemptId:d.attemptId,scorePercent:score,correctAnswers:correct,totalQuestions:total,passed,passingScorePercent:Number(settings.passing_score_percent),lifeLost:!passed,livesRemaining:lives,maxLives:Number(settings.max_lives),coinBalance:balance,refilled,refillCoinCost:Number(settings.refill_coin_cost),needsPurchase,xpEarned,totalXp};await client.query(`INSERT INTO gameplay_attempts(id,user_id,level_id,score_percent,correct_answers,total_questions,passed,life_lost,lives_after,refill_transaction_id,xp_awarded,result) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,[d.attemptId,req.user!.id,d.levelId,score,correct,total,passed,!passed,lives,refillTransactionId,xpEarned,result]);const awardedBadges=await awardEligibleBadges(req.user!.id,client);const finalResult={...result,awardedBadges};await client.query("UPDATE gameplay_attempts SET result=$1 WHERE id=$2",[finalResult,d.attemptId]);await client.query("COMMIT");res.status(201).json({success:true,...finalResult});}catch(error){await client.query("ROLLBACK");throw error;}finally{client.release();}});
 
+router.post("/gameplay/review", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
+	const parsed = z.object({ levelId: z.string().uuid(), answers: z.array(z.object({ questionId: z.string().uuid(), optionId: z.string().uuid() })).max(500) }).safeParse(req.body);
+	if (!parsed.success) return res.status(400).json({ success: false, errors: parsed.error.issues });
+	const answerMap = new Map(parsed.data.answers.map((answer) => [answer.questionId, answer.optionId]));
+	const result = await pool.query(`SELECT q.id question_id,q.question_text,q.explanation,o.id correct_option_id
+		FROM questions q JOIN question_options o ON o.question_id=q.id AND o.is_correct=true
+		WHERE q.level_id=$1 AND q.status='published' ORDER BY q.id`, [parsed.data.levelId]);
+	return res.json({ success: true, breakdown: result.rows.map((question: Record<string, any>) => ({
+		questionId: question.question_id, questionText: question.question_text, explanation: question.explanation || "",
+		correctOptionId: question.correct_option_id, selectedOptionId: answerMap.get(question.question_id) || null,
+		isCorrect: answerMap.get(question.question_id) === question.correct_option_id,
+	})) });
+});
+
 export default router;
