@@ -97,30 +97,32 @@ const parseBulkQuestions = (source: string) => {
 
 router.post("/admin/questions/bulk", verifyAdminToken, upload.single("file"), async (req, res) => {
   const placement = z.object({
-    ageGroupId: z.string().uuid(), categoryId: z.string().uuid(), levelId: z.string().uuid(),
+    ageGroupId: z.string().uuid().optional(), categoryId: z.string().uuid().optional(), levelId: z.string().uuid().optional(), learningLevelId: z.string().uuid().optional(),
     status: z.enum(["draft", "published"]).default("published"),
-  }).safeParse(req.body);
-  if (!placement.success) return res.status(400).json({ success: false, message: "Select a valid age group, category, and level." });
+  }).refine((value) => Boolean(value.learningLevelId) || Boolean(value.ageGroupId && value.categoryId && value.levelId), { message: "Select a valid question placement." }).safeParse(req.body);
+  if (!placement.success) return res.status(400).json({ success: false, message: "Select a valid CEDUGAMES or CEDU-LEARN level." });
   if (!req.file) return res.status(400).json({ success: false, message: "Choose a CSV file to upload." });
   const parsed = parseBulkQuestions(req.file.buffer.toString("utf8"));
   if (parsed.errors.length) return res.status(400).json({ success: false, errors: parsed.errors });
   let hierarchy;
   try {
-    hierarchy = await pool.query("SELECT 1 FROM game_levels l JOIN game_categories c ON c.id=l.category_id WHERE l.id=$1 AND c.id=$2 AND c.age_group_id=$3", [placement.data.levelId, placement.data.categoryId, placement.data.ageGroupId]);
+    hierarchy = placement.data.learningLevelId
+      ? await pool.query("SELECT 1 FROM learning_items WHERE id=$1 AND item_type='level'", [placement.data.learningLevelId])
+      : await pool.query("SELECT 1 FROM game_levels l JOIN game_categories c ON c.id=l.category_id WHERE l.id=$1 AND c.id=$2 AND c.age_group_id=$3", [placement.data.levelId, placement.data.categoryId, placement.data.ageGroupId]);
   } catch (error: any) {
     console.error("Bulk question placement lookup failed", error);
     if (["42P01", "42703"].includes(error?.code)) return res.status(503).json({ success: false, message: "The backend database is missing the question tables or columns. Run npm run migrate, then redeploy the backend." });
     throw error;
   }
-  if (!hierarchy.rowCount) return res.status(400).json({ success: false, message: "The selected age group, category, and level do not match." });
+  if (!hierarchy.rowCount) return res.status(400).json({ success: false, message: "The selected learning placement does not match." });
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
     for (const question of parsed.questions) {
       const inserted = await client.query(
-        `INSERT INTO questions(age_group_id,category_id,level_id,question_text,explanation,status)
-         VALUES($1,$2,$3,$4,'',$5) RETURNING id`,
-        [placement.data.ageGroupId, placement.data.categoryId, placement.data.levelId, question.question, placement.data.status],
+        `INSERT INTO questions(age_group_id,category_id,level_id,learning_level_id,question_text,explanation,status)
+         VALUES($1,$2,$3,$4,$5,'',$6) RETURNING id`,
+        [placement.data.ageGroupId || null, placement.data.categoryId || null, placement.data.levelId || null, placement.data.learningLevelId || null, question.question, placement.data.status],
       );
       for (let index = 0; index < question.options.length; index += 1) {
         await client.query(
