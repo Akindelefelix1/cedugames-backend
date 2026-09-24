@@ -7,6 +7,7 @@ import { logActivity } from "../helpers/activityLog";
 import { verifyAdminToken } from "../middlewares/authentication_middleware";
 import { generateQuestionDrafts } from "../services/ai_question_service";
 import { destroyMediaQuietly, StoredMedia, uploadMedia } from "../services/cloudinary_media_service";
+import { assertResourceUrls, destroyOnlyUnmanaged, registerImageResource } from "../helpers/resourceLibrary";
 
 const router = Router();
 const allowedMimeTypes: Record<string, string> = {
@@ -23,13 +24,14 @@ const upload = multer({
 });
 const fields = [{ name: "questionMedia", maxCount: 1 }, ...Array.from({ length: 4 }, (_, index) => ({ name: `optionMedia${index}`, maxCount: 1 }))];
 const shapeSchema = z.object({ type: z.enum(["circle", "square", "rectangle", "triangle", "star", "hexagon"]), color: z.string().regex(/^#[0-9a-fA-F]{6}$/) }).nullable().optional();
-const optionSchema = z.object({ text: z.string().trim().max(5000), isCorrect: z.boolean(), mediaType: z.enum(["image", "audio", "video", "document"]).nullable().optional(), shape: shapeSchema });
+const optionSchema = z.object({ text: z.string().trim().max(5000), isCorrect: z.boolean(), mediaType: z.enum(["image", "audio", "video", "document"]).nullable().optional(), mediaUrl: z.string().url().nullable().optional(), shape: shapeSchema });
 const bodySchema = z.object({
   questionText: z.string().trim().max(10000).default(""), explanation: z.string().trim().max(5000).default(""), shape: z.string().default("null").transform((value, ctx) => { try { return shapeSchema.parse(JSON.parse(value)); } catch { ctx.addIssue({ code: "custom", message: "Invalid question shape." }); return z.NEVER; } }),
   ageGroupId: z.string().uuid().optional(), categoryId: z.string().uuid().optional(), levelId: z.string().uuid().optional(), learningLevelId: z.string().uuid().optional(),
   status: z.enum(["draft", "published"]).default("published"),
   readAloud: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),
   questionMediaType: z.enum(["", "image", "audio", "video", "document"]).default(""),
+  questionResourceUrl: z.string().url().optional(),
   options: z.string().transform((value, ctx) => { try { return z.array(optionSchema).length(4).parse(JSON.parse(value)); } catch { ctx.addIssue({ code: "custom", message: "Four valid options are required." }); return z.NEVER; } }),
 }).refine((value) => Boolean(value.learningLevelId) || Boolean(value.ageGroupId && value.categoryId && value.levelId), { message: "Select a valid question placement." });
 const bulkHeaderNames = ["Questions", "Option A", "Option B", "Option C", "Option D", "Correct Answer"] as const;
@@ -177,9 +179,9 @@ router.post("/admin/questions", verifyAdminToken, upload.fields(fields), async (
   const questionFile = fileMap.questionMedia?.[0];
   const questionText = cleanRichText(data.questionText);
   const optionTexts = data.options.map((option) => cleanRichText(option.text));
-  if (!plainText(questionText) && !questionFile && !data.shape) return res.status(400).json({ success: false, message: "Question text, media, or a shape is required." });
+  if (!plainText(questionText) && !questionFile && !data.questionResourceUrl && !data.shape) return res.status(400).json({ success: false, message: "Question text, media, or a shape is required." });
   if (data.options.filter((option) => option.isCorrect).length !== 1) return res.status(400).json({ success: false, message: "Exactly one option must be correct." });
-  if (data.options.some((option, index) => !plainText(optionTexts[index] || "") && !fileMap[`optionMedia${index}`]?.[0] && !option.shape)) return res.status(400).json({ success: false, message: "Every option needs text, media, or a shape." });
+  if (data.options.some((option, index) => !plainText(optionTexts[index] || "") && !fileMap[`optionMedia${index}`]?.[0] && !option.mediaUrl && !option.shape)) return res.status(400).json({ success: false, message: "Every option needs text, media, or a shape." });
   const client = await pool.connect();
   let cloudFiles: Record<string, StoredMedia[]> = {};
   let committed = false;
@@ -187,11 +189,13 @@ router.post("/admin/questions", verifyAdminToken, upload.fields(fields), async (
     await client.query("BEGIN");
     const hierarchy = data.learningLevelId ? await client.query(`SELECT 1 FROM learning_items WHERE id=$1 AND item_type='level'`, [data.learningLevelId]) : await client.query(`SELECT 1 FROM game_levels l JOIN game_categories c ON c.id=l.category_id WHERE l.id=$1 AND c.id=$2 AND c.age_group_id=$3`, [data.levelId, data.categoryId, data.ageGroupId]);
     if (!hierarchy.rowCount) { await client.query("ROLLBACK"); return res.status(400).json({ success: false, message: "The selected age group, category, and level do not match." }); }
+    await assertResourceUrls(client, [data.questionResourceUrl, ...data.options.map((option) => option.mediaUrl)]);
     cloudFiles = await storeFiles(fileMap);
-    const inserted = await client.query(`INSERT INTO questions(age_group_id,category_id,level_id,learning_level_id,question_text,explanation,media_url,media_type,status,read_aloud,shape_type,shape_color) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`, [data.ageGroupId||null, data.categoryId||null, data.levelId||null, data.learningLevelId||null, questionText, data.explanation, storedMedia(cloudFiles, "questionMedia")?.url || null, questionFile ? data.questionMediaType : null, data.status, data.readAloud, data.shape?.type || null, data.shape?.color || null]);
+    await Promise.all(Object.keys(fileMap).map((field) => registerImageResource(storedMedia(cloudFiles, field), fileMap[field]?.[0], client)));
+    const inserted = await client.query(`INSERT INTO questions(age_group_id,category_id,level_id,learning_level_id,question_text,explanation,media_url,media_type,status,read_aloud,shape_type,shape_color) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`, [data.ageGroupId||null, data.categoryId||null, data.levelId||null, data.learningLevelId||null, questionText, data.explanation, storedMedia(cloudFiles, "questionMedia")?.url || data.questionResourceUrl || null, questionFile || data.questionResourceUrl ? data.questionMediaType : null, data.status, data.readAloud, data.shape?.type || null, data.shape?.color || null]);
     for (let index = 0; index < data.options.length; index += 1) {
       const option = data.options[index]!; const file = fileMap[`optionMedia${index}`]?.[0];
-      await client.query(`INSERT INTO question_options(question_id,option_order,option_text,media_url,media_type,is_correct,shape_type,shape_color) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, [inserted.rows[0].id, index, optionTexts[index], storedMedia(cloudFiles, `optionMedia${index}`)?.url || null, file ? option.mediaType : null, option.isCorrect, option.shape?.type || null, option.shape?.color || null]);
+      await client.query(`INSERT INTO question_options(question_id,option_order,option_text,media_url,media_type,is_correct,shape_type,shape_color) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, [inserted.rows[0].id, index, optionTexts[index], storedMedia(cloudFiles, `optionMedia${index}`)?.url || option.mediaUrl || null, file || option.mediaUrl ? option.mediaType : null, option.isCorrect, option.shape?.type || null, option.shape?.color || null]);
     }
     await client.query("COMMIT");
     committed = true;
@@ -252,25 +256,27 @@ router.put("/admin/questions/:id", verifyAdminToken, upload.fields(fields), asyn
     if (!current.rows[0]) { await client.query("ROLLBACK"); return res.status(404).json({ success: false, message: "Question not found." }); }
     const hierarchy = data.learningLevelId ? await client.query(`SELECT 1 FROM learning_items WHERE id=$1 AND item_type='level'`, [data.learningLevelId]) : await client.query(`SELECT 1 FROM game_levels l JOIN game_categories c ON c.id=l.category_id WHERE l.id=$1 AND c.id=$2 AND c.age_group_id=$3`, [data.levelId, data.categoryId, data.ageGroupId]);
     if (!hierarchy.rowCount) { await client.query("ROLLBACK"); return res.status(400).json({ success: false, message: "The selected age group, category, and level do not match." }); }
+    await assertResourceUrls(client, [data.questionResourceUrl, ...data.options.map((option) => option.mediaUrl)]);
     cloudFiles = await storeFiles(fileMap);
+    await Promise.all(Object.keys(fileMap).map((field) => registerImageResource(storedMedia(cloudFiles, field), fileMap[field]?.[0], client)));
     const questionFile = fileMap.questionMedia?.[0];
-    const questionMediaUrl = questionFile ? storedMedia(cloudFiles, "questionMedia")?.url : removeMedia.has("question") ? null : current.rows[0].media_url;
-    if ((questionFile || removeMedia.has("question")) && current.rows[0].media_url) replacedUrls.push(current.rows[0].media_url);
-    const questionMediaType = questionFile ? data.questionMediaType : removeMedia.has("question") ? null : current.rows[0].media_type;
+    const questionMediaUrl = questionFile ? storedMedia(cloudFiles, "questionMedia")?.url : data.questionResourceUrl || (removeMedia.has("question") ? null : current.rows[0].media_url);
+    if ((questionFile || data.questionResourceUrl || removeMedia.has("question")) && current.rows[0].media_url && current.rows[0].media_url !== questionMediaUrl) replacedUrls.push(current.rows[0].media_url);
+    const questionMediaType = questionFile || data.questionResourceUrl ? data.questionMediaType : removeMedia.has("question") ? null : current.rows[0].media_type;
     if (!plainText(questionText) && !questionMediaUrl && !data.shape) { await client.query("ROLLBACK"); await cleanupStored(cloudFiles); return res.status(400).json({ success: false, message: "Question text, media, or a shape is required." }); }
     if (data.options.filter((option) => option.isCorrect).length !== 1) { await client.query("ROLLBACK"); await cleanupStored(cloudFiles); return res.status(400).json({ success: false, message: "Exactly one option must be correct." }); }
     await client.query(`UPDATE questions SET age_group_id=$1,category_id=$2,level_id=$3,learning_level_id=$4,question_text=$5,explanation=$6,media_url=$7,media_type=$8,status=$9,read_aloud=$10,shape_type=$11,shape_color=$12,updated_at=NOW() WHERE id=$13`, [data.ageGroupId||null,data.categoryId||null,data.levelId||null,data.learningLevelId||null,questionText,data.explanation,questionMediaUrl,questionMediaType,data.status,data.readAloud,data.shape?.type||null,data.shape?.color||null,req.params.id]);
     for (let index = 0; index < 4; index += 1) {
       const option = data.options[index]!; const file = fileMap[`optionMedia${index}`]?.[0]; const existing = current.rows[0].options[index] || {};
-      const optionMediaUrl = file ? storedMedia(cloudFiles, `optionMedia${index}`)?.url : removeMedia.has(`option${index}`) ? null : existing.mediaUrl;
-      if ((file || removeMedia.has(`option${index}`)) && existing.mediaUrl) replacedUrls.push(existing.mediaUrl);
-      const optionMediaType = file ? option.mediaType : removeMedia.has(`option${index}`) ? null : existing.mediaType;
+      const optionMediaUrl = file ? storedMedia(cloudFiles, `optionMedia${index}`)?.url : option.mediaUrl || (removeMedia.has(`option${index}`) ? null : existing.mediaUrl);
+      if ((file || option.mediaUrl || removeMedia.has(`option${index}`)) && existing.mediaUrl && existing.mediaUrl !== optionMediaUrl) replacedUrls.push(existing.mediaUrl);
+      const optionMediaType = file || option.mediaUrl ? option.mediaType : removeMedia.has(`option${index}`) ? null : existing.mediaType;
       if (!plainText(optionTexts[index] || "") && !optionMediaUrl && !option.shape) { await client.query("ROLLBACK"); await cleanupStored(cloudFiles); return res.status(400).json({ success: false, message: `Option ${index + 1} needs text, media, or a shape.` }); }
       await client.query(`UPDATE question_options SET option_text=$1,media_url=$2,media_type=$3,is_correct=$4,shape_type=$5,shape_color=$6 WHERE question_id=$7 AND option_order=$8`, [optionTexts[index],optionMediaUrl,optionMediaType,option.isCorrect,option.shape?.type||null,option.shape?.color||null,req.params.id,index]);
     }
     await client.query("COMMIT");
     committed = true;
-    await Promise.all(replacedUrls.map(destroyMediaQuietly));
+    await Promise.all((await destroyOnlyUnmanaged(replacedUrls)).map(destroyMediaQuietly));
     await logActivity({ eventType: "content.question_updated", title: "Question updated", description: "An existing question was updated" });
     return res.json({ success: true, message: "Question updated." });
   } catch (error) { if (!committed) { await client.query("ROLLBACK"); await cleanupStored(cloudFiles); } throw error; } finally { client.release(); }
@@ -284,7 +290,8 @@ router.delete("/admin/questions/:id", verifyAdminToken, async (req, res) => {
     const deleted = await client.query("DELETE FROM questions WHERE id=$1 RETURNING id", [req.params.id]);
     if (!deleted.rows[0]) { await client.query("ROLLBACK"); return res.status(404).json({ success: false, message: "Question not found." }); }
     await client.query("COMMIT");
-    await Promise.all(files.rows.map((fileRow: { media_url: string | null }) => destroyMediaQuietly(fileRow.media_url)));
+    const unmanaged = await destroyOnlyUnmanaged(files.rows.map((fileRow: { media_url: string | null }) => fileRow.media_url || ""));
+    await Promise.all(unmanaged.map(destroyMediaQuietly));
     await logActivity({ eventType: "content.question_deleted", title: "Question deleted", description: "A question was deleted" });
     return res.json({ success: true, message: "Question deleted." });
   } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
