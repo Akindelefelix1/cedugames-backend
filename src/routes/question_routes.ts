@@ -198,9 +198,31 @@ router.post("/admin/questions", verifyAdminToken, upload.fields(fields), async (
   } catch (error) { if (!committed) { await client.query("ROLLBACK"); await cleanupStored(cloudFiles); } throw error; } finally { client.release(); }
 });
 
-router.get("/admin/questions", verifyAdminToken, async (_req, res) => {
-  const result = await pool.query(`SELECT q.id,q.question_text,q.status,q.created_at,q.age_group_id,q.category_id,q.level_id,c.name category_name,l.name level_name,l.level_number FROM questions q JOIN game_categories c ON c.id=q.category_id JOIN game_levels l ON l.id=q.level_id ORDER BY q.created_at DESC,q.id DESC`);
-  return res.json({ success: true, questions: result.rows.map((row: Record<string, any>) => ({ id: row.id, text: plainText(row.question_text) || "Visual question", status: row.status, createdAt: row.created_at, ageGroupId: row.age_group_id, categoryId: row.category_id, category: row.category_name, levelId: row.level_id, level: row.level_name, levelNumber: row.level_number })) });
+router.get("/admin/questions", verifyAdminToken, async (req, res) => {
+  const pageSize = 15;
+  const requestedPage = Number.parseInt(String(req.query.page || "1"), 10);
+  const page = Number.isFinite(requestedPage) && requestedPage > 0 ? requestedPage : 1;
+  const search = String(req.query.search || "").trim();
+  const searchPattern = `%${search}%`;
+  const offset = (page - 1) * pageSize;
+  const where = search
+    ? `WHERE q.question_text ILIKE $1 OR c.name ILIKE $1 OR l.name ILIKE $1 OR q.status ILIKE $1`
+    : "";
+  const values = search ? [searchPattern, pageSize, offset] : [pageSize, offset];
+  const limitParameter = search ? "$2" : "$1";
+  const offsetParameter = search ? "$3" : "$2";
+
+  const [result, countResult] = await Promise.all([
+    pool.query(`SELECT q.id,q.question_text,q.status,q.created_at,q.age_group_id,q.category_id,q.level_id,c.name category_name,l.name level_name,l.level_number FROM questions q JOIN game_categories c ON c.id=q.category_id JOIN game_levels l ON l.id=q.level_id ${where} ORDER BY q.created_at DESC,q.id DESC LIMIT ${limitParameter} OFFSET ${offsetParameter}`, values),
+    pool.query(`SELECT COUNT(*)::int total FROM questions q JOIN game_categories c ON c.id=q.category_id JOIN game_levels l ON l.id=q.level_id ${where}`, search ? [searchPattern] : []),
+  ]);
+  const total = countResult.rows[0]?.total || 0;
+
+  return res.json({
+    success: true,
+    questions: result.rows.map((row: Record<string, any>) => ({ id: row.id, text: plainText(row.question_text) || "Visual question", status: row.status, createdAt: row.created_at, ageGroupId: row.age_group_id, categoryId: row.category_id, category: row.category_name, levelId: row.level_id, level: row.level_name, levelNumber: row.level_number })),
+    pagination: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) },
+  });
 });
 
 router.get("/admin/questions/:id", verifyAdminToken, async (req, res) => {
