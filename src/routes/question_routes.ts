@@ -22,6 +22,15 @@ const upload = multer({
   limits: { fileSize: 20 * 1024 * 1024, files: 5 },
   fileFilter: (_req, file, done) => allowedMimeTypes[file.mimetype] ? done(null, true) : done(new Error("Unsupported media type.")),
 });
+const isValidImageBuffer = (file: Express.Multer.File) => {
+  if (!file.mimetype.startsWith("image/")) return true;
+  const bytes = file.buffer;
+  if (file.mimetype === "image/jpeg") return bytes.length > 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+  if (file.mimetype === "image/png") return bytes.length > 8 && bytes.subarray(0, 8).equals(Buffer.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a]));
+  if (file.mimetype === "image/gif") return ["GIF87a", "GIF89a"].includes(bytes.subarray(0, 6).toString("ascii"));
+  if (file.mimetype === "image/webp") return bytes.subarray(0, 4).toString("ascii") === "RIFF" && bytes.subarray(8, 12).toString("ascii") === "WEBP";
+  return false;
+};
 const fields = [{ name: "questionMedia", maxCount: 1 }, ...Array.from({ length: 4 }, (_, index) => ({ name: `optionMedia${index}`, maxCount: 1 }))];
 const shapeSchema = z.object({ type: z.enum(["circle", "square", "rectangle", "triangle", "star", "hexagon"]), color: z.string().regex(/^#[0-9a-fA-F]{6}$/) }).nullable().optional();
 const optionSchema = z.object({ text: z.string().trim().max(5000), isCorrect: z.boolean(), mediaType: z.enum(["image", "audio", "video", "document"]).nullable().optional(), mediaUrl: z.string().url().nullable().optional(), shape: shapeSchema });
@@ -173,6 +182,7 @@ router.post("/admin/questions/ai/generate", verifyAdminToken, async (req, res) =
 
 router.post("/admin/questions", verifyAdminToken, upload.fields(fields), async (req, res) => {
   const fileMap = (req.files || {}) as Record<string, Express.Multer.File[]>;
+  if (Object.values(fileMap).flat().some((file) => !isValidImageBuffer(file))) return res.status(400).json({ success: false, message: "One of the selected image files is invalid." });
   const parsed = bodySchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ success: false, errors: parsed.error.issues });
   const data = parsed.data;
@@ -240,6 +250,7 @@ router.get("/admin/questions/:id", verifyAdminToken, async (req, res) => {
 
 router.put("/admin/questions/:id", verifyAdminToken, upload.fields(fields), async (req, res) => {
   const fileMap = (req.files || {}) as Record<string, Express.Multer.File[]>;
+  if (Object.values(fileMap).flat().some((file) => !isValidImageBuffer(file))) return res.status(400).json({ success: false, message: "One of the selected image files is invalid." });
   const parsed = bodySchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ success: false, errors: parsed.error.issues });
   const data = parsed.data;

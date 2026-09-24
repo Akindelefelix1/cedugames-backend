@@ -6,7 +6,7 @@ export const handleGlobalErrors = (err: any, _req: Request, res: Response, _next
     res.status(400).json({ success: false, message: "Invalid JSON payload." });
     return;
   }
-  if (err?.name === "MulterError" || err?.message === "Unsupported media type.") {
+  if (err?.name === "MulterError" || err?.message === "Unsupported media type." || err?.message?.startsWith("Only JPEG")) {
     res.status(400).json({ success: false, message: err.message || "Invalid uploaded file." });
     return;
   }

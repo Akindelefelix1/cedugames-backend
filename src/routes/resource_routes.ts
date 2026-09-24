@@ -14,14 +14,23 @@ const upload = multer({
   fileFilter: (_req, file, done) => imageTypes.has(file.mimetype) ? done(null, true) : done(new Error("Only JPEG, PNG, GIF, and WebP images are supported.")),
 });
 const categorySchema = z.object({ name: z.string().trim().min(2).max(120), description: z.string().trim().max(500).default("") });
+const uuidSchema = z.string().uuid();
+const isImageBuffer = (file: Express.Multer.File) => {
+  const bytes = file.buffer;
+  if (file.mimetype === "image/jpeg") return bytes.length > 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+  if (file.mimetype === "image/png") return bytes.length > 8 && bytes.subarray(0, 8).equals(Buffer.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a]));
+  if (file.mimetype === "image/gif") return bytes.subarray(0, 6).toString("ascii") === "GIF87a" || bytes.subarray(0, 6).toString("ascii") === "GIF89a";
+  if (file.mimetype === "image/webp") return bytes.subarray(0, 4).toString("ascii") === "RIFF" && bytes.subarray(8, 12).toString("ascii") === "WEBP";
+  return false;
+};
 
 router.get("/admin/resource-categories", verifyAdminToken, async (_req, res) => {
-  const result = await pool.query(
+  const [result, totalResult] = await Promise.all([pool.query(
     `SELECT c.id,c.name,c.description,c.created_at,COUNT(r.id)::int asset_count
      FROM resource_categories c LEFT JOIN resources r ON r.category_id=c.id
      GROUP BY c.id ORDER BY LOWER(c.name)`,
-  );
-  res.json({ success: true, categories: result.rows.map((row: Record<string, any>) => ({ id: row.id, name: row.name, description: row.description, assetCount: row.asset_count, createdAt: row.created_at })) });
+  ), pool.query("SELECT COUNT(*)::int total FROM resources")]);
+  res.json({ success: true, total: totalResult.rows[0]?.total || 0, categories: result.rows.map((row: Record<string, any>) => ({ id: row.id, name: row.name, description: row.description, assetCount: row.asset_count, createdAt: row.created_at })) });
 });
 
 router.post("/admin/resource-categories", verifyAdminToken, async (req, res) => {
@@ -37,6 +46,7 @@ router.post("/admin/resource-categories", verifyAdminToken, async (req, res) => 
 });
 
 router.patch("/admin/resource-categories/:id", verifyAdminToken, async (req, res) => {
+  if (!uuidSchema.safeParse(req.params.id).success) return res.status(400).json({ success: false, message: "Invalid resource category." });
   const parsed = categorySchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ success: false, message: parsed.error.issues[0]?.message || "Enter a valid category name." });
   try {
@@ -50,6 +60,7 @@ router.patch("/admin/resource-categories/:id", verifyAdminToken, async (req, res
 });
 
 router.delete("/admin/resource-categories/:id", verifyAdminToken, async (req, res) => {
+  if (!uuidSchema.safeParse(req.params.id).success) return res.status(400).json({ success: false, message: "Invalid resource category." });
   const result = await pool.query("DELETE FROM resource_categories WHERE id=$1 RETURNING id", [req.params.id]);
   if (!result.rows[0]) return res.status(404).json({ success: false, message: "Resource category not found." });
   return res.json({ success: true, message: "Category removed. Its images remain in All resources." });
@@ -58,8 +69,9 @@ router.delete("/admin/resource-categories/:id", verifyAdminToken, async (req, re
 router.get("/admin/resources", verifyAdminToken, async (req, res) => {
   const page = Math.max(1, Number.parseInt(String(req.query.page || "1"), 10) || 1);
   const limit = Math.min(60, Math.max(12, Number.parseInt(String(req.query.limit || "24"), 10) || 24));
-  const search = String(req.query.search || "").trim();
+  const search = String(req.query.search || "").trim().slice(0, 120);
   const categoryId = String(req.query.categoryId || "").trim();
+  if (categoryId && !uuidSchema.safeParse(categoryId).success) return res.status(400).json({ success: false, message: "Invalid resource category." });
   const filters: string[] = [];
   const values: unknown[] = [];
   if (search) { values.push(`%${search}%`); filters.push(`r.name ILIKE $${values.length}`); }
@@ -80,8 +92,10 @@ router.get("/admin/resources", verifyAdminToken, async (req, res) => {
 
 router.post("/admin/resources", verifyAdminToken, upload.single("image"), async (req, res) => {
   if (!req.file) return res.status(400).json({ success: false, message: "Select an image to upload." });
+  if (!isImageBuffer(req.file)) return res.status(400).json({ success: false, message: "The selected file is not a valid image." });
   const categoryId = String(req.body.categoryId || "").trim() || null;
   if (categoryId) {
+    if (!uuidSchema.safeParse(categoryId).success) return res.status(400).json({ success: false, message: "Select a valid resource category." });
     const category = await pool.query("SELECT 1 FROM resource_categories WHERE id=$1", [categoryId]);
     if (!category.rowCount) return res.status(400).json({ success: false, message: "Select a valid resource category." });
   }
@@ -98,14 +112,20 @@ router.post("/admin/resources", verifyAdminToken, upload.single("image"), async 
 });
 
 router.patch("/admin/resources/:id", verifyAdminToken, async (req, res) => {
+  if (!uuidSchema.safeParse(req.params.id).success) return res.status(400).json({ success: false, message: "Invalid resource." });
   const parsed = z.object({ name: z.string().trim().min(1).max(255), categoryId: z.string().uuid().nullable().optional() }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ success: false, message: "Enter a valid resource name and category." });
+  if (parsed.data.categoryId) {
+    const category = await pool.query("SELECT 1 FROM resource_categories WHERE id=$1", [parsed.data.categoryId]);
+    if (!category.rowCount) return res.status(400).json({ success: false, message: "Select a valid resource category." });
+  }
   const result = await pool.query("UPDATE resources SET name=$1,category_id=$2,updated_at=NOW() WHERE id=$3 RETURNING *", [parsed.data.name, parsed.data.categoryId || null, req.params.id]);
   if (!result.rows[0]) return res.status(404).json({ success: false, message: "Resource not found." });
   return res.json({ success: true, resource: result.rows[0] });
 });
 
 router.delete("/admin/resources/:id", verifyAdminToken, async (req, res) => {
+  if (!uuidSchema.safeParse(req.params.id).success) return res.status(400).json({ success: false, message: "Invalid resource." });
   const current = await pool.query(
     `SELECT r.*,((SELECT COUNT(*) FROM questions q WHERE q.media_url=r.url) + (SELECT COUNT(*) FROM question_options o WHERE o.media_url=r.url))::int usage_count
      FROM resources r WHERE r.id=$1`, [req.params.id],
