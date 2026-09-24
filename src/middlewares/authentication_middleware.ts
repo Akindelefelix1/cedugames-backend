@@ -32,9 +32,9 @@ export const verifyAdminToken = async (req: AuthenticatedRequest, res: Response,
       next();
       return;
     }
-    const result = await pool.query("SELECT role,token_version FROM users WHERE id=$1", [decoded.id]);
+    const result = await pool.query("SELECT role,token_version,is_active FROM users WHERE id=$1", [decoded.id]);
     const admin = result.rows[0];
-    if (!admin || admin.role !== "admin" || decoded.role !== "admin" || admin.token_version !== decoded.ver) throw new Error("Session revoked");
+    if (!admin || admin.role !== "admin" || decoded.role !== "admin" || !admin.is_active || admin.token_version !== decoded.ver) throw new Error("Session revoked");
     req.user = decoded;
     next();
   } catch {
