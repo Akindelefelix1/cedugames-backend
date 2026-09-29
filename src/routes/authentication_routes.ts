@@ -66,8 +66,11 @@ router.post("/admin/login", sensitiveLimiter, async (req, res) => {
 router.get("/admin/users", verifyAdminToken, async (_req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id,name,username,email,age,profile_image_url,total_xp,coins_count,lives_remaining,is_verified,created_at
-       FROM users WHERE role='user' ORDER BY created_at DESC`,
+      `SELECT u.id,u.name,u.username,u.email,u.age,u.profile_image_url,u.total_xp,u.coins_count,u.lives_remaining,u.is_verified,u.created_at,
+              COUNT(c.id)::int child_count,(u.coins_count+COALESCE(SUM(c.coins_count),0))::bigint household_coins_count
+       FROM users u LEFT JOIN users c ON c.parent_user_id=u.id
+       WHERE u.role='user' AND u.parent_user_id IS NULL
+       GROUP BY u.id ORDER BY u.created_at DESC`,
     );
     return res.json({ success: true, count: result.rowCount || 0, users: result.rows });
   } catch (error) {
@@ -85,13 +88,13 @@ router.get("/admin/users/:id", verifyAdminToken, async (req, res) => {
     const userResult = await pool.query(
       `SELECT id,name,username,email,age,role,profile_image_url,total_xp,coins_count,lives_remaining,
        is_verified,is_oauth,created_at,updated_at
-       FROM users WHERE id=$1 AND role='user'`,
+       FROM users WHERE id=$1 AND role='user' AND parent_user_id IS NULL`,
       [userId],
     );
     const user = userResult.rows[0];
     if (!user) return res.status(404).json({ success: false, message: "User not found." });
 
-    const [performance, attempts, coinTransactions, purchases, earnedBadges] = await Promise.all([
+    const [performance, attempts, coinTransactions, purchases, earnedBadges, childProfiles] = await Promise.all([
       pool.query(
         `SELECT COUNT(a.id)::int attempts,
          COUNT(a.id) FILTER (WHERE a.passed)::int passed_attempts,
@@ -137,6 +140,7 @@ router.get("/admin/users/:id", verifyAdminToken, async (req, res) => {
          WHERE ub.user_id=$1 ORDER BY ub.earned_at DESC`,
         [user.id],
       ),
+      pool.query(`SELECT id,name,username,age,profile_image_url,total_xp,coins_count,lives_remaining,created_at FROM users WHERE parent_user_id=$1 ORDER BY created_at`, [user.id]),
     ]);
     return res.json({
       success: true,
@@ -148,6 +152,7 @@ router.get("/admin/users/:id", verifyAdminToken, async (req, res) => {
       recentAttempts: attempts.rows,
       recentCoinTransactions: coinTransactions.rows,
       earnedBadges: earnedBadges.rows,
+      childProfiles: childProfiles.rows,
     });
   } catch (error) {
     console.error("Admin user profile failed", { userId, error });
@@ -275,7 +280,7 @@ router.post("/admin/account/password", verifyAdminToken, async (req: Authenticat
 router.get("/user/profile", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
   try {
     const [userResult, performance, badges, attempts] = await Promise.all([
-      pool.query(`SELECT id,name,username,email,age,profile_image_url,total_xp,coins_count,lives_remaining,is_verified,is_oauth,created_at,updated_at FROM users WHERE id=$1 AND role='user'`,[req.user!.id]),
+      pool.query(`SELECT u.id,u.name,u.username,COALESCE(parent.email,u.email) email,u.age,u.profile_image_url,u.total_xp,u.coins_count,u.lives_remaining,u.is_verified,u.is_oauth,u.parent_user_id,u.created_at,u.updated_at FROM users u LEFT JOIN users parent ON parent.id=u.parent_user_id WHERE u.id=$1 AND u.role='user'`,[req.user!.id]),
       pool.query(`SELECT COUNT(a.id)::int attempts,COUNT(a.id) FILTER(WHERE a.passed)::int passed_attempts,
         COUNT(DISTINCT a.level_id) FILTER(WHERE a.passed)::int completed_levels,
         COALESCE(ROUND(AVG(a.score_percent)),0)::int average_score,COALESCE(MAX(a.score_percent),0)::int best_score,
@@ -317,12 +322,63 @@ router.patch("/user/profile", verifyPlayerToken, async (req: AuthenticatedReques
 });
 
 const preferenceSchema = z.object({ ageGroupId: z.string().uuid(), categoryId: z.string().uuid() });
+const childProfileSchema = z.object({ name: z.string().trim().min(2).max(120), age: z.number().int().min(1).max(25) });
+
+router.get("/user/profiles", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
+  const accountId = req.user!.accountId || req.user!.id;
+  const result = await pool.query(
+    `SELECT u.id,u.name,u.username,u.age,u.profile_image_url,u.total_xp,u.coins_count,u.lives_remaining,
+            u.parent_user_id,(u.id=$1) is_primary,COUNT(a.id)::int attempts,MAX(a.created_at) last_played
+     FROM users u LEFT JOIN gameplay_attempts a ON a.user_id=u.id
+     WHERE u.id=$1 OR u.parent_user_id=$1
+     GROUP BY u.id ORDER BY (u.id=$1) DESC,u.created_at`,
+    [accountId],
+  );
+  return res.json({ success: true, accountId, profiles: result.rows, childCount: result.rows.filter((row: { is_primary: boolean }) => !row.is_primary).length });
+});
+
+router.post("/user/profiles", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
+  const parsed = childProfileSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ success: false, message: parsed.error.issues[0]?.message || "Enter valid child details." });
+  const accountId = req.user!.accountId || req.user!.id;
+  const id = crypto.randomUUID();
+  const slug = parsed.data.name.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "").slice(0, 20) || "player";
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const account = await client.query("SELECT id FROM users WHERE id=$1 AND parent_user_id IS NULL FOR UPDATE", [accountId]);
+    if (!account.rows[0]) { await client.query("ROLLBACK"); return res.status(404).json({ success: false, message: "Household account not found." }); }
+    const count = await client.query("SELECT COUNT(*)::int total FROM users WHERE parent_user_id=$1", [accountId]);
+    if (Number(count.rows[0].total) >= 10) { await client.query("ROLLBACK"); return res.status(409).json({ success: false, message: "An account can have up to 10 child profiles." }); }
+    const result = await client.query(
+      `INSERT INTO users(id,name,username,email,age,role,is_verified,parent_user_id,password)
+       VALUES($1,$2,$3,$4,$5,'user',true,$6,NULL)
+       RETURNING id,name,username,age,profile_image_url,total_xp,coins_count,lives_remaining,parent_user_id,false is_primary`,
+      [id, parsed.data.name, `${slug}_${id.slice(0, 8)}`, `child.${id}@profiles.cedugames.local`, parsed.data.age, accountId],
+    );
+    await client.query("COMMIT");
+    logActivity({ eventType: "profile.child_created", title: "Child profile added", description: `${parsed.data.name} was added to a household`, actorId: accountId, actorName: parsed.data.name, metadata: { profileId: id } }).catch((error) => console.error("Child profile activity log failed", { profileId: id, error }));
+    return res.status(201).json({ success: true, message: `${parsed.data.name}'s profile is ready.`, profile: result.rows[0] });
+  } catch (error) { await client.query("ROLLBACK"); throw error; }
+  finally { client.release(); }
+});
+
+router.patch("/user/profiles/:id", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
+  if (!z.string().uuid().safeParse(req.params.id).success) return res.status(400).json({ success: false, message: "Invalid child profile." });
+  const parsed = childProfileSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ success: false, message: parsed.error.issues[0]?.message || "Enter valid child details." });
+  const accountId = req.user!.accountId || req.user!.id;
+  const result = await pool.query(`UPDATE users SET name=$1,age=$2,updated_at=NOW() WHERE id=$3 AND parent_user_id=$4 RETURNING id,name,username,age,profile_image_url,total_xp,coins_count,lives_remaining,parent_user_id,false is_primary`, [parsed.data.name, parsed.data.age, req.params.id, accountId]);
+  if (!result.rows[0]) return res.status(404).json({ success: false, message: "Child profile not found." });
+  return res.json({ success: true, message: "Child profile updated.", profile: result.rows[0] });
+});
+
 router.get("/user/dashboard-bootstrap", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
   const [player, preferences, notifications] = await Promise.all([
     pool.query(
-      `SELECT u.id,u.name,u.username,u.email,u.profile_image_url,u.coins_count,u.lives_remaining,
+      `SELECT u.id,u.name,u.username,COALESCE(parent.email,u.email) email,u.profile_image_url,u.coins_count,u.lives_remaining,u.parent_user_id,
               s.max_lives,s.passing_score_percent,s.refill_coin_cost
-       FROM users u CROSS JOIN gameplay_settings s
+       FROM users u CROSS JOIN gameplay_settings s LEFT JOIN users parent ON parent.id=u.parent_user_id
        WHERE u.id=$1 AND s.id=1`,
       [req.user!.id],
     ),
@@ -349,6 +405,7 @@ router.get("/user/dashboard-bootstrap", verifyPlayerToken, async (req: Authentic
       username: player.rows[0].username,
       email: player.rows[0].email,
       profile_image_url: player.rows[0].profile_image_url,
+      isPrimary: !player.rows[0].parent_user_id,
     },
     wallet: {
       coins_count: player.rows[0].coins_count,
@@ -438,7 +495,7 @@ router.post("/login", sensitiveLimiter, async (req, res) => {
   const email = normalizeEmail(identifier);
   const phone = normalizePhone(identifier);
   try {
-    const result = await pool.query("SELECT id,name,username,email,phone,password,role,is_verified,profile_image_url,token_version FROM users WHERE lower(email)=$1 OR phone=$2 LIMIT 1", [email, phone]);
+    const result = await pool.query("SELECT id,name,username,email,phone,password,role,is_verified,profile_image_url,token_version FROM users WHERE parent_user_id IS NULL AND (lower(email)=$1 OR phone=$2) LIMIT 1", [email, phone]);
     const user = result.rows[0];
     const matches = user?.password ? await comparePassword(validation.data.password, user.password) : false;
     if (!matches) return res.status(401).json({ success: false, message: "Invalid email or phone number or password." });
@@ -559,9 +616,10 @@ router.post("/reset-password", sensitiveLimiter, async (req, res) => {
 router.post("/update-password", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
   const validation = UpdatePassword.safeParse(req.body);
   if (!validation.success) return res.status(400).json({ success: false, errors: validation.error.issues });
-  const user = await pool.query("SELECT password FROM users WHERE id=$1", [req.user!.id]);
+  const accountId = req.user!.accountId || req.user!.id;
+  const user = await pool.query("SELECT password FROM users WHERE id=$1", [accountId]);
   if (!user.rows[0]?.password || !(await comparePassword(validation.data.currentPassword, user.rows[0].password))) return res.status(401).json({ success: false, message: "Current password is incorrect." });
-  await pool.query("UPDATE users SET password=$1,token_version=token_version+1,updated_at=NOW() WHERE id=$2", [await hashPassword(validation.data.newPassword), req.user!.id]);
+  await pool.query("UPDATE users SET password=$1,token_version=token_version+1,updated_at=NOW() WHERE id=$2", [await hashPassword(validation.data.newPassword), accountId]);
   return res.json({ success: true, message: "Password updated successfully. Sign in again on other devices." });
 });
 
