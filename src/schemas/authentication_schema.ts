@@ -16,6 +16,7 @@ export type RegisterUserInput = z.infer<typeof RegisterUserSchema>;
 const UserLoginSchema = z.object({
   identifier: z.string().trim().min(3).max(320),
   password: z.string().min(10).max(128),
+  rememberMe: z.boolean().optional().default(false),
 });
 const AdminLoginSchema = z.object({
   email: z.string().email(),

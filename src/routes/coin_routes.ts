@@ -33,12 +33,14 @@ router.post("/airtime/redemptions", verifyPlayerToken, async (req:AuthenticatedR
 
 router.post("/coins/purchases", verifyPlayerToken, async (req:AuthenticatedRequest,res) => {
   const parsed=purchaseSchema.safeParse(req.body);if(!parsed.success)return invalid(res,parsed.error);
+  const accountId=req.user!.accountId||req.user!.id;
+  if(req.user!.id!==accountId)return res.status(403).json({success:false,code:"MAIN_PROFILE_REQUIRED",message:"For parental safety, coin purchases must be started from the main household profile."});
   try{const checkout=await createCoinCheckout(req.user!.id,parsed.data.packageId);res.status(201).json({success:true,...checkout});}
   catch(e:any){res.status(e.status||500).json({success:false,message:e.message||"Payment could not be started."});}
 });
 router.post("/coins/purchases/verify", verifyPlayerToken, async (req:AuthenticatedRequest,res) => {
   const parsed=verifyPurchaseSchema.safeParse(req.body);if(!parsed.success)return invalid(res,parsed.error);
-  try{const result=await completeCoinPurchase(parsed.data.transactionId,parsed.data.txRef,req.user!.id);res.json({success:true,...result});}
+  try{const result=await completeCoinPurchase(parsed.data.transactionId,parsed.data.txRef,req.user!.accountId||req.user!.id);res.json({success:true,...result});}
   catch(e:any){res.status(e.status||500).json({success:false,message:e.message||"Payment could not be verified."});}
 });
 router.post("/coins/flutterwave/webhook", async (req:any,res) => {
