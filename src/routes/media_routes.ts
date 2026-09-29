@@ -35,8 +35,10 @@ router.post("/user/profile/image", verifyPlayerToken, upload.single("image"), as
   const media = await uploadMedia(req.file, "profiles");
   try {
     const result = await pool.query(
-      `UPDATE users SET profile_image_url=$1,updated_at=NOW() WHERE id=$2 AND role='user'
-       RETURNING id,name,username,email,age,profile_image_url,total_xp,coins_count,lives_remaining,is_verified,is_oauth,created_at,updated_at`,
+      `WITH updated AS (
+        UPDATE users SET profile_image_url=$1,updated_at=NOW() WHERE id=$2 AND role='user' RETURNING *
+       ) SELECT u.id,u.name,u.username,COALESCE(parent.email,u.email) email,u.age,u.profile_image_url,u.total_xp,u.coins_count,u.lives_remaining,u.is_verified,u.is_oauth,u.parent_user_id,(u.parent_user_id IS NULL) "isPrimary",u.created_at,u.updated_at
+       FROM updated u LEFT JOIN users parent ON parent.id=u.parent_user_id`,
       [media.url, req.user!.id],
     );
     await destroyMediaQuietly(current.rows[0].profile_image_url);

@@ -309,8 +309,10 @@ router.patch("/user/profile", verifyPlayerToken, async (req: AuthenticatedReques
   if(!validation.success)return res.status(400).json({success:false,errors:validation.error.issues});
   const d=validation.data;
   try {
-    const result=await pool.query(`UPDATE users SET name=$1,username=$2,age=$3,updated_at=NOW()
-      WHERE id=$4 AND role='user' RETURNING id,name,username,email,age,profile_image_url,total_xp,coins_count,lives_remaining,is_verified,is_oauth,created_at,updated_at`,
+    const result=await pool.query(`WITH updated AS (
+      UPDATE users SET name=$1,username=$2,age=$3,updated_at=NOW() WHERE id=$4 AND role='user' RETURNING *
+    ) SELECT u.id,u.name,u.username,COALESCE(parent.email,u.email) email,u.age,u.profile_image_url,u.total_xp,u.coins_count,u.lives_remaining,u.is_verified,u.is_oauth,u.parent_user_id,(u.parent_user_id IS NULL) "isPrimary",u.created_at,u.updated_at
+      FROM updated u LEFT JOIN users parent ON parent.id=u.parent_user_id`,
       [d.name,d.username,d.age,req.user!.id]);
     await logActivity({eventType:"user.profile_updated",title:"Profile updated",description:`${d.name} updated their player profile`,actorId:req.user!.id,actorName:d.name});
     return res.json({success:true,message:"Profile updated successfully.",user:result.rows[0]});
@@ -533,7 +535,7 @@ router.post("/google", sensitiveLimiter, async (req, res, next) => {
 
 async function issueOtp(emailValue: string, purpose: "register" | "password_reset") {
   const email = normalizeEmail(emailValue);
-  const user = await pool.query("SELECT id,is_verified FROM users WHERE lower(email)=$1", [email]);
+  const user = await pool.query("SELECT id,is_verified FROM users WHERE parent_user_id IS NULL AND lower(email)=$1", [email]);
   if (!user.rows[0]) return;
   if (purpose === "register" && user.rows[0].is_verified) return;
   const otp = generateOtp();
@@ -580,7 +582,7 @@ router.post("/verify-otp", sensitiveLimiter, async (req, res) => {
       return res.status(400).json({ success: false, message: "Invalid or expired verification code." });
     }
     if (purpose === "register") {
-      await client.query("UPDATE users SET is_verified=true,updated_at=NOW() WHERE lower(email)=$1", [email]);
+      await client.query("UPDATE users SET is_verified=true,updated_at=NOW() WHERE parent_user_id IS NULL AND lower(email)=$1", [email]);
       await client.query("UPDATE otps SET is_used=true WHERE id=$1", [result.rows[0].id]);
       await client.query("COMMIT");
       return res.json({ success: true, message: "Account verified successfully. You can now log in." });
@@ -606,7 +608,7 @@ router.post("/reset-password", sensitiveLimiter, async (req, res) => {
     await client.query("BEGIN");
     const consumed = await client.query("UPDATE otps SET is_used=true WHERE id=$1 AND email=$2 AND is_used=false AND expires_at>NOW() RETURNING id", [decoded.otpId, decoded.email]);
     if (!consumed.rows[0]) { await client.query("ROLLBACK"); return res.status(403).json({ success: false, message: "Recovery token was already used or expired." }); }
-    await client.query("UPDATE users SET password=$1,token_version=token_version+1,updated_at=NOW() WHERE lower(email)=$2", [await hashPassword(validation.data.newPassword), decoded.email]);
+    await client.query("UPDATE users SET password=$1,token_version=token_version+1,updated_at=NOW() WHERE parent_user_id IS NULL AND lower(email)=$2", [await hashPassword(validation.data.newPassword), decoded.email]);
     await client.query("COMMIT");
     return res.json({ success: true, message: "Password reset successful. You can now log in." });
   } catch { await client.query("ROLLBACK"); return res.status(403).json({ success: false, message: "Invalid or expired recovery token." }); }
