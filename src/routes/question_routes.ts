@@ -111,7 +111,7 @@ router.post("/admin/questions/bulk", verifyAdminToken, upload.single("file"), as
     ageGroupId: z.string().uuid().optional(), categoryId: z.string().uuid().optional(), levelId: z.string().uuid().optional(), learningLevelId: z.string().uuid().optional(),
     status: z.enum(["draft", "published"]).default("published"),
   }).refine((value) => Boolean(value.learningLevelId) || Boolean(value.ageGroupId && value.categoryId && value.levelId), { message: "Select a valid question placement." }).safeParse(req.body);
-  if (!placement.success) return res.status(400).json({ success: false, message: "Select a valid CEDUGAMES or CEDU-LEARN level." });
+  if (!placement.success) return res.status(400).json({ success: false, message: "Select a valid CEDU or CEDU-LEARN level." });
   if (!req.file) return res.status(400).json({ success: false, message: "Choose a CSV file to upload." });
   const parsed = parseBulkQuestions(req.file.buffer.toString("utf8"));
   if (parsed.errors.length) return res.status(400).json({ success: false, errors: parsed.errors });
@@ -277,6 +277,7 @@ router.put("/admin/questions/:id", verifyAdminToken, upload.fields(fields), asyn
     if (!plainText(questionText) && !questionMediaUrl && !data.shape) { await client.query("ROLLBACK"); await cleanupStored(cloudFiles); return res.status(400).json({ success: false, message: "Question text, media, or a shape is required." }); }
     if (data.options.filter((option) => option.isCorrect).length !== 1) { await client.query("ROLLBACK"); await cleanupStored(cloudFiles); return res.status(400).json({ success: false, message: "Exactly one option must be correct." }); }
     await client.query(`UPDATE questions SET age_group_id=$1,category_id=$2,level_id=$3,learning_level_id=$4,question_text=$5,explanation=$6,media_url=$7,media_type=$8,status=$9,read_aloud=$10,shape_type=$11,shape_color=$12,updated_at=NOW() WHERE id=$13`, [data.ageGroupId||null,data.categoryId||null,data.levelId||null,data.learningLevelId||null,questionText,data.explanation,questionMediaUrl,questionMediaType,data.status,data.readAloud,data.shape?.type||null,data.shape?.color||null,req.params.id]);
+    await client.query("UPDATE question_options SET is_correct=false WHERE question_id=$1", [req.params.id]);
     for (let index = 0; index < 4; index += 1) {
       const option = data.options[index]!; const file = fileMap[`optionMedia${index}`]?.[0]; const existing = current.rows[0].options[index] || {};
       const optionMediaUrl = file ? storedMedia(cloudFiles, `optionMedia${index}`)?.url : option.mediaUrl || (removeMedia.has(`option${index}`) ? null : existing.mediaUrl);

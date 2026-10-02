@@ -24,7 +24,7 @@ services:
       - key: ZOHO_MAIL_FROM
         sync: false
       - key: ZOHO_MAIL_FROM_NAME
-        value: CeduGames
+        value: Cedu
       - key: MAIL_SEND_TIMEOUT_MS
         value: "10000"
       - key: CORS_ORIGINS

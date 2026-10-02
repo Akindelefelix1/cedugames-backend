@@ -6,7 +6,7 @@ const RegisterUserSchema = z.object({
   username: z.string().min(3),
   email: z.string().email(),
   phone: z.string().trim().min(7).max(20),
-  password: z.string().min(10).max(128),
+  password: z.string().min(8).max(128),
   age: z.number().int().positive(),
 });
 
@@ -15,7 +15,7 @@ export type RegisterUserInput = z.infer<typeof RegisterUserSchema>;
 //Login Zod Schema
 const UserLoginSchema = z.object({
   identifier: z.string().trim().min(3).max(320),
-  password: z.string().min(10).max(128),
+  password: z.string().min(8).max(128),
   rememberMe: z.boolean().optional().default(false),
 });
 const AdminLoginSchema = z.object({
@@ -54,13 +54,13 @@ const ResendOtpSchema = z.object({
 
 //reset-password zod schema
 const ResetPasswordSchema = z.object({
-  newPassword: z.string().min(10).max(128),
+  newPassword: z.string().min(8).max(128),
 });
 
 //update password zod schema
 const UpdatePassword = z.object({
   currentPassword: z.string(),
-  newPassword: z.string().min(10).max(128),
+  newPassword: z.string().min(8).max(128),
 });
 const UpdateProfileSchema = z.object({
   name: z.string().trim().min(2).max(120),

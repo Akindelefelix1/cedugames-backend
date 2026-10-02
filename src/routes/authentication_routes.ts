@@ -25,7 +25,12 @@ const sensitiveLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 8, standardHe
 router.use(authLimiter);
 
 const normalizeEmail = (email: string) => email.trim().toLowerCase();
-const normalizePhone = (phone: string) => phone.trim().replace(/[\s().-]/g, "");
+const normalizePhone = (phone: string) => {
+  const cleaned = phone.trim().replace(/[\s().-]/g, "");
+  if (/^0\d{10}$/.test(cleaned)) return `+234${cleaned.slice(1)}`;
+  if (/^234\d{10}$/.test(cleaned)) return `+${cleaned}`;
+  return cleaned;
+};
 const signSession = (user: { id: string; role: string; token_version: number }, rememberMe = false) =>
   jwt.sign({ id: user.id, role: user.role, ver: user.token_version }, env.JWT_SECRET, {
     expiresIn: rememberMe ? "30d" : "24h", issuer: "cedugames-api", audience: "cedugames-client",
@@ -445,7 +450,7 @@ router.post("/user/register", sensitiveLimiter, async (req, res) => {
   const { name, password, age } = validation.data;
   const email = normalizeEmail(validation.data.email);
   const phone = normalizePhone(validation.data.phone);
-  if (!/^\+?[1-9]\d{6,14}$/.test(phone)) return res.status(400).json({ success: false, message: "Enter a valid phone number with country code." });
+  if (!/^\+?[1-9]\d{6,14}$/.test(phone)) return res.status(400).json({ success: false, message: "Enter a valid phone number." });
   const username = validation.data.username.trim().toLowerCase();
   const otp = generateOtp();
   const client = await pool.connect();
