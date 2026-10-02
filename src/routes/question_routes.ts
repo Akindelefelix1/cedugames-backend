@@ -111,7 +111,7 @@ router.post("/admin/questions/bulk", verifyAdminToken, upload.single("file"), as
     ageGroupId: z.string().uuid().optional(), categoryId: z.string().uuid().optional(), levelId: z.string().uuid().optional(), learningLevelId: z.string().uuid().optional(),
     status: z.enum(["draft", "published"]).default("published"),
   }).refine((value) => Boolean(value.learningLevelId) || Boolean(value.ageGroupId && value.categoryId && value.levelId), { message: "Select a valid question placement." }).safeParse(req.body);
-  if (!placement.success) return res.status(400).json({ success: false, message: "Select a valid CEDUGAMES or CEDU-LEARN level." });
+  if (!placement.success) return res.status(400).json({ success: false, message: "Select a valid CEDU or CEDU-LEARN level." });
   if (!req.file) return res.status(400).json({ success: false, message: "Choose a CSV file to upload." });
   const parsed = parseBulkQuestions(req.file.buffer.toString("utf8"));
   if (parsed.errors.length) return res.status(400).json({ success: false, errors: parsed.errors });

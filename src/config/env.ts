@@ -10,7 +10,7 @@ const EnvSchema = z.object({
   ZOHO_MAIL_API_URL: z.string().url().default("https://api.zeptomail.com/v1.1/email"),
   ZOHO_MAIL_API_TOKEN: z.string().default(""),
   ZOHO_MAIL_FROM: z.union([z.literal(""), z.string().email()]).default(""),
-  ZOHO_MAIL_FROM_NAME: z.string().min(1).default("CeduGames"),
+  ZOHO_MAIL_FROM_NAME: z.string().min(1).default("Cedu"),
   MAIL_SEND_TIMEOUT_MS: z.coerce.number().int().min(1000).max(120000).default(10000),
   EMAIL_VERIFICATION_ENABLED: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),
   CORS_ORIGINS: z.string().default("http://localhost:3000,http://localhost:5173,https://cedugames-admin.onrender.com,https://cedugames-user.onrender.com"),

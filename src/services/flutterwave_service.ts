@@ -63,7 +63,7 @@ export async function createCoinCheckout(userId: string, packageId: string) {
         redirect_url: env.FLW_REDIRECT_URL,
         customer: { email: selected.email, name: selected.user_name },
         meta: { purchase_type: "coin_package", package_id: selected.id },
-        customizations: { title: "CeduGames Coin Purchase", description: selected.name },
+        customizations: { title: "Cedu Coin Purchase", description: selected.name },
       }),
     });
     return { checkoutUrl: payment.data.link as string, txRef };
