@@ -41,9 +41,9 @@ router.post("/coins/transfers", verifyPlayerToken, async (req:AuthenticatedReque
     const repeated=await client.query("SELECT amount,balance_after,metadata FROM coin_transactions WHERE reference=$1 AND user_id=$2",[senderReference,accountId]);
     if(repeated.rows[0]){
       const originalRecipientId=String(repeated.rows[0].metadata?.recipientId||d.recipientId);
-      const recipient=await client.query("SELECT id,name,coins_count FROM users WHERE id=$1 AND parent_user_id=$2",[originalRecipientId,accountId]);
+      const [currentSender,recipient]=await Promise.all([client.query("SELECT coins_count FROM users WHERE id=$1",[accountId]),client.query("SELECT id,name,coins_count FROM users WHERE id=$1 AND parent_user_id=$2",[originalRecipientId,accountId])]);
       await client.query("COMMIT");
-      return res.json({success:true,repeated:true,amount:Math.abs(Number(repeated.rows[0].amount)),recipient:recipient.rows[0]?{id:recipient.rows[0].id,name:recipient.rows[0].name}:null,senderBalance:Number(repeated.rows[0].balance_after),recipientBalance:Number(recipient.rows[0]?.coins_count||0)});
+      return res.json({success:true,repeated:true,amount:Math.abs(Number(repeated.rows[0].amount)),recipient:recipient.rows[0]?{id:recipient.rows[0].id,name:recipient.rows[0].name}:null,senderBalance:Number(currentSender.rows[0]?.coins_count||0),recipientBalance:Number(recipient.rows[0]?.coins_count||0)});
     }
     const profiles=await client.query("SELECT id,name FROM users WHERE id=ANY($1::uuid[]) AND role='user' FOR UPDATE",[[accountId,d.recipientId].sort()]);
     const sender=profiles.rows.find((row:{id:string})=>row.id===accountId),recipient=profiles.rows.find((row:{id:string})=>row.id===d.recipientId);
