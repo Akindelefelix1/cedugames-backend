@@ -15,3 +15,7 @@ CREATE TABLE IF NOT EXISTS family_page_slides (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   UNIQUE(position)
 );
+
+-- migrate:down
+DROP TABLE IF EXISTS family_page_slides;
+DROP TABLE IF EXISTS family_page_settings;
