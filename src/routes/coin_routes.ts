@@ -20,9 +20,44 @@ const purchaseSchema = z.object({ packageId: uuid });
 const verifyPurchaseSchema = z.object({ transactionId: z.coerce.number().int().positive(), txRef: z.string().trim().min(1).max(160) });
 const airtimePurchaseSchema = z.object({ phone:z.string().trim().min(10).max(20), network:z.enum(["MTN","AIRTEL","GLO","9MOBILE"]), amount:z.number().int().min(1).max(1000000), clientReference:uuid });
 const airtimeSettingsSchema = z.object({ pointsPerNaira:z.number().int().min(1).max(1000000), minimumAmount:z.number().int().min(1).max(1000000), maximumAmount:z.number().int().min(1).max(1000000), isEnabled:z.boolean() }).refine(v=>v.minimumAmount<=v.maximumAmount,{message:"Minimum amount cannot exceed maximum amount.",path:["minimumAmount"]});
+const householdTransferSchema = z.object({ recipientId:uuid, amount:z.number().int().min(1).max(1000000), clientTransferId:uuid });
 
 router.get("/coins/packages", async (_req,res) => { const r=await pool.query("SELECT id,name,description,coins,price_minor,currency,sort_order FROM coin_packages WHERE is_active=true ORDER BY sort_order,coins"); res.json({success:true,packages:r.rows}); });
 router.get("/coins/me", verifyPlayerToken, async (req:AuthenticatedRequest,res) => { const r=await pool.query("SELECT coins_count FROM users WHERE id=$1",[req.user!.id]); res.json({success:true,balance:Number(r.rows[0]?.coins_count||0)}); });
+router.get("/coins/transfer-recipients", verifyPlayerToken, async (req:AuthenticatedRequest,res) => {
+  const accountId=req.user!.accountId||req.user!.id;
+  if(req.user!.id!==accountId)return res.status(403).json({success:false,code:"MAIN_PROFILE_REQUIRED",message:"Only the main household profile can transfer coins."});
+  const r=await pool.query("SELECT id,name,age,profile_image_url,coins_count FROM users WHERE parent_user_id=$1 AND role='user' ORDER BY created_at,id",[accountId]);
+  res.json({success:true,recipients:r.rows.map((row:Record<string,unknown>)=>({id:row.id,name:row.name,age:row.age,profileImageUrl:row.profile_image_url,balance:Number(row.coins_count||0)}))});
+});
+router.post("/coins/transfers", verifyPlayerToken, async (req:AuthenticatedRequest,res) => {
+  const accountId=req.user!.accountId||req.user!.id;
+  if(req.user!.id!==accountId)return res.status(403).json({success:false,code:"MAIN_PROFILE_REQUIRED",message:"Only the main household profile can transfer coins."});
+  const parsed=householdTransferSchema.safeParse(req.body);
+  if(!parsed.success)return res.status(400).json({success:false,message:parsed.error.issues[0]?.message||"Enter a valid transfer."});
+  const d=parsed.data,client=await pool.connect(),senderReference=`household-transfer:${d.clientTransferId}:sender`,recipientReference=`household-transfer:${d.clientTransferId}:recipient`;
+  try{
+    await client.query("BEGIN");
+    const repeated=await client.query("SELECT amount,balance_after,metadata FROM coin_transactions WHERE reference=$1 AND user_id=$2",[senderReference,accountId]);
+    if(repeated.rows[0]){
+      const originalRecipientId=String(repeated.rows[0].metadata?.recipientId||d.recipientId);
+      const recipient=await client.query("SELECT id,name,coins_count FROM users WHERE id=$1 AND parent_user_id=$2",[originalRecipientId,accountId]);
+      await client.query("COMMIT");
+      return res.json({success:true,repeated:true,amount:Math.abs(Number(repeated.rows[0].amount)),recipient:recipient.rows[0]?{id:recipient.rows[0].id,name:recipient.rows[0].name}:null,senderBalance:Number(repeated.rows[0].balance_after),recipientBalance:Number(recipient.rows[0]?.coins_count||0)});
+    }
+    const profiles=await client.query("SELECT id,name FROM users WHERE id=ANY($1::uuid[]) AND role='user' FOR UPDATE",[[accountId,d.recipientId].sort()]);
+    const sender=profiles.rows.find((row:{id:string})=>row.id===accountId),recipient=profiles.rows.find((row:{id:string})=>row.id===d.recipientId);
+    if(!sender)throw Object.assign(new Error("Main household profile not found."),{status:404});
+    const ownership=await client.query("SELECT 1 FROM users WHERE id=$1 AND parent_user_id=$2 AND role='user'",[d.recipientId,accountId]);
+    if(!recipient||!ownership.rowCount)throw Object.assign(new Error("Select a child profile linked to this household."),{status:403});
+    const metadata={kind:"household_transfer",transferId:d.clientTransferId,senderId:accountId,recipientId:d.recipientId};
+    const outgoing=await recordCoinTransaction({userId:accountId,type:"deduction",amount:d.amount,description:`Transferred ${d.amount.toLocaleString()} coins to ${recipient.name}`,reference:senderReference,metadata},client);
+    const incoming=await recordCoinTransaction({userId:d.recipientId,type:"reward",amount:d.amount,description:`Received ${d.amount.toLocaleString()} coins from ${sender.name}`,reference:recipientReference,createdBy:accountId,metadata},client);
+    await client.query("COMMIT");
+    await logActivity({eventType:"coins.household_transfer",title:"Coins transferred to child",description:`${sender.name} transferred ${d.amount} coins to ${recipient.name}`,actorId:accountId,actorName:sender.name,metadata});
+    return res.status(201).json({success:true,repeated:false,amount:d.amount,recipient:{id:recipient.id,name:recipient.name},senderBalance:Number(outgoing.balance_after),recipientBalance:Number(incoming.balance_after)});
+  }catch(error:any){await client.query("ROLLBACK");if(error.code==="23505")return res.status(409).json({success:false,message:"This transfer was already processed."});if(error.status)return res.status(error.status).json({success:false,message:error.message});throw error;}finally{client.release();}
+});
 router.get("/coins/me/transactions", verifyPlayerToken, async (req:AuthenticatedRequest,res) => { const {page,limit}=paging(req.query); const count=await pool.query("SELECT COUNT(*)::int total FROM coin_transactions WHERE user_id=$1",[req.user!.id]); const r=await pool.query(`SELECT t.id,t.type,t.amount,t.balance_after,t.description,t.reference,t.created_at,
   COALESCE(r.name, NULLIF(t.metadata->>'eventKey','')) action_name
   FROM coin_transactions t
