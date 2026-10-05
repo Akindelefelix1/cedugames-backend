@@ -12,6 +12,7 @@ import notificationRoutes from "./notification_routes";
 import dailyCheckinRoutes from "./daily_checkin_routes";
 import mediaRoutes from "./media_routes";
 import resourceRoutes from "./resource_routes";
+import familyPageRoutes from "./family_page_routes";
 import {Router} from 'express';
 
 const router = Router();
@@ -29,5 +30,6 @@ router.use(notificationRoutes);
 router.use(dailyCheckinRoutes);
 router.use(mediaRoutes);
 router.use(resourceRoutes);
+router.use(familyPageRoutes);
 
 export default router;
