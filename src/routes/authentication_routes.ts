@@ -24,6 +24,12 @@ const authLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 30, standardHeader
 const sensitiveLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 8, standardHeaders: "draft-8", legacyHeaders: false });
 router.use(authLimiter);
 
+const AccountDeletionRequestSchema = z.object({
+  email: z.string().trim().email().max(254),
+  username: z.string().trim().max(80).optional().or(z.literal("")),
+  reason: z.string().trim().max(1000).optional().or(z.literal("")),
+});
+
 const normalizeEmail = (email: string) => email.trim().toLowerCase();
 const normalizePhone = (phone: string) => {
   const cleaned = phone.trim().replace(/[\s().-]/g, "");
@@ -31,6 +37,37 @@ const normalizePhone = (phone: string) => {
   if (/^234\d{10}$/.test(cleaned)) return `+${cleaned}`;
   return cleaned;
 };
+
+router.post("/account-deletion-requests", sensitiveLimiter, async (req, res) => {
+  const validation = AccountDeletionRequestSchema.safeParse(req.body);
+  if (!validation.success) {
+    return res.status(400).json({ success: false, message: validation.error.issues[0]?.message || "Enter a valid email address." });
+  }
+
+  const email = normalizeEmail(validation.data.email);
+  try {
+    const existing = await pool.query(
+      `SELECT id FROM account_deletion_requests
+       WHERE lower(email)=$1 AND status IN ('pending','verified')
+       ORDER BY requested_at DESC LIMIT 1`,
+      [email],
+    );
+    const request = existing.rows[0] || (await pool.query(
+      `INSERT INTO account_deletion_requests(email,username,reason)
+       VALUES($1,$2,$3) RETURNING id`,
+      [email, validation.data.username || null, validation.data.reason || null],
+    )).rows[0];
+
+    return res.status(202).json({
+      success: true,
+      message: "Your deletion request has been received. We may contact you by email to verify account ownership.",
+      requestId: request.id,
+    });
+  } catch (error) {
+    console.error("Account deletion request failed", error);
+    return res.status(500).json({ success: false, message: "Your request could not be submitted right now. Please try again later." });
+  }
+});
 const signSession = (user: { id: string; role: string; token_version: number }, rememberMe = false) =>
   jwt.sign({ id: user.id, role: user.role, ver: user.token_version }, env.JWT_SECRET, {
     expiresIn: rememberMe ? "30d" : "24h", issuer: "cedugames-api", audience: "cedugames-client",
@@ -70,14 +107,27 @@ router.post("/admin/login", sensitiveLimiter, async (req, res) => {
 
 router.get("/admin/users", verifyAdminToken, async (_req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT u.id,u.name,u.username,u.email,u.age,u.profile_image_url,u.total_xp,u.coins_count,u.lives_remaining,u.is_verified,u.created_at,
+    const [result, totals] = await Promise.all([
+      pool.query(
+        `SELECT u.id,u.name,u.username,u.email,u.age,u.profile_image_url,u.total_xp,u.coins_count,u.lives_remaining,u.is_verified,u.created_at,
               COUNT(c.id)::int child_count,(u.coins_count+COALESCE(SUM(c.coins_count),0))::bigint household_coins_count
        FROM users u LEFT JOIN users c ON c.parent_user_id=u.id
        WHERE u.role='user' AND u.parent_user_id IS NULL
        GROUP BY u.id ORDER BY u.created_at DESC`,
-    );
-    return res.json({ success: true, count: result.rowCount || 0, users: result.rows });
+      ),
+      pool.query(`SELECT COUNT(*)::int total_users,
+        COUNT(*) FILTER (WHERE created_at >= CURRENT_DATE)::int new_today,
+        COUNT(*) FILTER (WHERE is_verified=true)::int verified_users
+        FROM users WHERE role='user'`),
+    ]);
+    return res.json({
+      success: true,
+      count: result.rowCount || 0,
+      totalUsers: totals.rows[0]?.total_users || 0,
+      newToday: totals.rows[0]?.new_today || 0,
+      verifiedUsers: totals.rows[0]?.verified_users || 0,
+      users: result.rows,
+    });
   } catch (error) {
     console.error("Admin user listing failed", error);
     return res.status(500).json({ success: false, message: "Users could not be loaded." });
