@@ -1,13 +1,13 @@
 import { Router } from "express";
 import multer from "multer";
 import { z } from "zod";
-import sanitizeHtml from "sanitize-html";
 import pool from "../config/database_connection";
 import { logActivity } from "../helpers/activityLog";
 import { verifyAdminToken } from "../middlewares/authentication_middleware";
 import { generateQuestionDrafts } from "../services/ai_question_service";
 import { destroyMediaQuietly, StoredMedia, uploadMedia } from "../services/cloudinary_media_service";
 import { assertResourceUrls, destroyOnlyUnmanaged, registerImageResource } from "../helpers/resourceLibrary";
+import { cleanRichText, plainText } from "../helpers/htmlSanitizer";
 
 const router = Router();
 const allowedMimeTypes: Record<string, string> = {
@@ -55,8 +55,6 @@ const storeFiles = async (fileMap: Record<string, Express.Multer.File[]>) => {
 };
 const storedMedia = (fileMap: Record<string, StoredMedia[]>, field: string) => fileMap[field]?.[0];
 const cleanupStored = (fileMap: Record<string, StoredMedia[]>) => Promise.all(Object.values(fileMap).flat().map(destroyMediaQuietly));
-const cleanRichText = (value: string) => sanitizeHtml(value, { allowedTags: ["p","br","strong","b","em","i","u","s","ul","ol","li","div"], allowedAttributes: { div: ["style"], p: ["style"] }, allowedStyles: { "*": { "text-align": [/^left$/, /^center$/, /^right$/] } } });
-const plainText = (value: string) => sanitizeHtml(value, { allowedTags: [], allowedAttributes: {} }).replace(/&nbsp;/g, " ").trim();
 const generationSchema = z.object({
   ageGroupId: z.string().uuid(), categoryId: z.string().uuid(), levelId: z.string().uuid(),
   count: z.number().int().min(1).max(20).default(5),
