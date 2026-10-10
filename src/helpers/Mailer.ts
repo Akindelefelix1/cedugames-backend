@@ -6,7 +6,6 @@ export const SendOtp = async (email: string, otp: string): Promise<void> => {
   }
 
   try {
-    // Render values are sometimes pasted with the documented authorization
     // prefix. Keep the environment variable compatible with either format.
     const sendMailToken = env.ZOHO_MAIL_API_TOKEN
       .trim()
