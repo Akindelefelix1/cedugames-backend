@@ -68,9 +68,9 @@ router.post("/account-deletion-requests", sensitiveLimiter, async (req, res) => 
     return res.status(500).json({ success: false, message: "Your request could not be submitted right now. Please try again later." });
   }
 });
-const signSession = (user: { id: string; role: string; token_version: number }, rememberMe = false) =>
+const signSession = (user: { id: string; role: string; token_version: number }) =>
   jwt.sign({ id: user.id, role: user.role, ver: user.token_version }, env.JWT_SECRET, {
-    expiresIn: rememberMe ? "30d" : "24h", issuer: "cedugames-api", audience: "cedugames-client",
+    expiresIn: "24h", issuer: "cedugames-api", audience: "cedugames-client",
   });
 
 const signAdminSession = (admin: { id: string; role: string; token_version: number }) =>
@@ -558,7 +558,7 @@ router.post("/login", sensitiveLimiter, async (req, res) => {
     if (!matches) return res.status(401).json({ success: false, message: "Invalid email or phone number or password." });
     if (!user.is_verified) return res.status(403).json({ success: false, message: "Verify your email before signing in." });
     await logActivity({ eventType: "user.signed_in", title: "User signed in", description: `${user.name} signed in`, actorId: user.id, actorName: user.name });
-    return res.json({ success: true, message: "Sign in successful.", token: signSession(user, validation.data.rememberMe), user: { id: user.id, name: user.name, username: user.username, email: user.email, phone: user.phone, role: user.role, profile_image_url: user.profile_image_url } });
+    return res.json({ success: true, message: "Sign in successful.", token: signSession(user), user: { id: user.id, name: user.name, username: user.username, email: user.email, phone: user.phone, role: user.role, profile_image_url: user.profile_image_url } });
   } catch (error) {
     console.error("Login failed", error);
     return res.status(500).json({ success: false, message: "Sign in could not be completed." });
