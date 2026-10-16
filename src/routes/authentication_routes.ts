@@ -149,7 +149,7 @@ router.get("/admin/users/:id", verifyAdminToken, async (req, res) => {
     const user = userResult.rows[0];
     if (!user) return res.status(404).json({ success: false, message: "User not found." });
 
-    const [performance, attempts, coinTransactions, purchases, earnedBadges, childProfiles] = await Promise.all([
+    const [performance, attempts, coinTransactions, purchases, earnedBadges, childProfiles, institutionMemberships] = await Promise.all([
       pool.query(
         `SELECT COUNT(a.id)::int attempts,
          COUNT(a.id) FILTER (WHERE a.passed)::int passed_attempts,
@@ -196,6 +196,9 @@ router.get("/admin/users/:id", verifyAdminToken, async (req, res) => {
         [user.id],
       ),
       pool.query(`SELECT id,name,username,age,profile_image_url,total_xp,coins_count,lives_remaining,created_at FROM users WHERE parent_user_id=$1 ORDER BY created_at`, [user.id]),
+      pool.query(`SELECT m.id,m.status,m.source,m.requested_at,m.approved_at,i.id institution_id,i.name institution_name,i.institution_type,i.city,i.state,i.country,i.is_public
+        FROM institution_memberships m JOIN institutions i ON i.id=m.institution_id
+        WHERE m.user_id=$1 ORDER BY m.requested_at DESC`, [user.id]),
     ]);
     return res.json({
       success: true,
@@ -208,6 +211,7 @@ router.get("/admin/users/:id", verifyAdminToken, async (req, res) => {
       recentCoinTransactions: coinTransactions.rows,
       earnedBadges: earnedBadges.rows,
       childProfiles: childProfiles.rows,
+      institutionMemberships: institutionMemberships.rows,
     });
   } catch (error) {
     console.error("Admin user profile failed", { userId, error });

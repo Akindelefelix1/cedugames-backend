@@ -1,5 +1,8 @@
 //This combines all the route modules
 import aunthentication_routes from "./authentication_routes"
+import institutionAuthRoutes from "./institution_auth_routes"
+import institutionNetworkRoutes from "./institution_network_routes"
+import institutionAdminRoutes from "./institution_admin_routes"
 import catalogRoutes from "./catalog_routes";
 import publicCatalogRoutes from "./public_catalog_routes";
 import questionRoutes from "./question_routes";
@@ -18,6 +21,9 @@ import {Router} from 'express';
 const router = Router();
 
 router.use("/auth", aunthentication_routes);
+router.use("/auth/institution", institutionAuthRoutes);
+router.use("/institutions", institutionNetworkRoutes);
+router.use("/admin/institutions", institutionAdminRoutes);
 router.use("/admin/catalog", catalogRoutes);
 router.use("/catalog", publicCatalogRoutes);
 router.use(questionRoutes);
