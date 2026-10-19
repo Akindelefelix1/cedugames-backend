@@ -58,4 +58,19 @@ router.get("/me", verifyInstitutionToken, async (req: InstitutionRequest, res) =
   return res.json({ success: true, account: accountShape(result.rows[0]) });
 });
 
+router.patch("/visibility", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
+  if (typeof req.body?.publicAccess !== "boolean") return res.status(400).json({ success: false, message: "Choose whether your institution is public or invite-only." });
+  try {
+    const result = await pool.query(
+      "UPDATE institutions SET is_public=$1 WHERE id=$2 AND is_active=true RETURNING id,name,institution_type,owner_name,email,phone,address,city,state,country,is_public,invite_code,created_at",
+      [req.body.publicAccess, req.institution!.id],
+    );
+    if (!result.rows[0]) return res.status(404).json({ success: false, message: "Institution account not found." });
+    return res.json({ success: true, message: result.rows[0].is_public ? "Institution is now public." : "Institution is now invite-only.", account: accountShape(result.rows[0]) });
+  } catch (error) {
+    console.error("Institution visibility update failed", error);
+    return res.status(500).json({ success: false, message: "Institution visibility could not be updated." });
+  }
+});
+
 export default router;
