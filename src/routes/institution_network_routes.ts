@@ -141,6 +141,41 @@ router.post("/structure/levels/:id/questions", verifyInstitutionToken, async (re
   finally { client.release(); }
 });
 
+router.get("/questions", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
+  const result = await pool.query(`SELECT q.id,q.subject,q.question_text,q.explanation,q.status,q.created_at,q.updated_at,COALESCE(json_agg(json_build_object('text',o.option_text,'isCorrect',o.is_correct) ORDER BY o.option_order) FILTER (WHERE o.id IS NOT NULL),'[]') options,l.name level_name,c.name category_name FROM institution_questions q JOIN institution_levels l ON l.id=q.level_id JOIN institution_categories c ON c.id=l.category_id LEFT JOIN institution_question_options o ON o.question_id=q.id WHERE q.institution_id=$1 GROUP BY q.id,l.name,c.name ORDER BY q.created_at DESC`, [req.institution!.id]);
+  return res.json({ success: true, questions: result.rows.map((row: Record<string, any>) => ({ id: row.id, text: row.question_text, explanation: row.explanation, subject: row.subject, level: row.level_name, section: row.category_name, type: "Multiple choice", status: row.status === "published" ? "Published" : "Draft", updated: row.updated_at, plays: 0, options: row.options })) });
+});
+
+router.delete("/questions/:id", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
+  const result = await pool.query("DELETE FROM institution_questions WHERE id=$1 AND institution_id=$2 RETURNING id,subject,level_id", [req.params.id, req.institution!.id]);
+  if (!result.rows[0]) return res.status(404).json({ success: false, message: "Question not found." });
+  await logActivity({ eventType: "institution.question_deleted", title: "Institution question deleted", description: `A question was removed from ${result.rows[0].subject}`, metadata: { institutionId: req.institution!.id, levelId: result.rows[0].level_id } });
+  return res.json({ success: true, message: "Question deleted." });
+});
+
+router.get("/activity", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
+  const result = await pool.query(
+    `SELECT id,event_type,title,description,actor_name,metadata,created_at
+     FROM activity_logs WHERE metadata->>'institutionId'=$1 ORDER BY created_at DESC LIMIT 100`, [req.institution!.id],
+  );
+  return res.json({ success: true, activities: result.rows });
+});
+
+router.get("/dashboard", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
+  const institutionId = req.institution!.id;
+  const [metrics, activities, requests] = await Promise.all([
+    pool.query(`SELECT (SELECT COUNT(*)::int FROM institution_memberships WHERE institution_id=$1 AND status='active') students,(SELECT COUNT(*)::int FROM institution_questions WHERE institution_id=$1) questions,(SELECT COUNT(*)::int FROM institution_memberships WHERE institution_id=$1 AND status='pending') pending_requests`, [institutionId]),
+    pool.query(`SELECT id,event_type,title,description,actor_name,metadata,created_at FROM activity_logs WHERE metadata->>'institutionId'=$1 ORDER BY created_at DESC LIMIT 4`, [institutionId]),
+    pool.query(`SELECT m.id,u.name,u.username,u.email,m.requested_at FROM institution_memberships m JOIN users u ON u.id=m.user_id WHERE m.institution_id=$1 AND m.status='pending' ORDER BY m.requested_at DESC LIMIT 5`, [institutionId]),
+  ]);
+  return res.json({ success: true, metrics: metrics.rows[0] || { students: 0, questions: 0, pending_requests: 0 }, activities: activities.rows, requests: requests.rows });
+});
+
+router.get("/students", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
+  const result = await pool.query(`SELECT m.id,u.name,u.username,u.email,m.status,m.approved_at FROM institution_memberships m JOIN users u ON u.id=m.user_id WHERE m.institution_id=$1 AND m.status='active' ORDER BY u.name`, [req.institution!.id]);
+  return res.json({ success: true, students: result.rows.map((row: Record<string, any>) => ({ id: row.id, name: row.name, username: row.username, email: row.email, className: "Not assigned", progress: 0, lastSeen: row.approved_at ? new Date(row.approved_at).toLocaleDateString() : "Not available", status: "Active", initials: String(row.name || "IN").split(/\s+/).map(part => part[0]).join("").slice(0, 2).toUpperCase() })) });
+});
+
 router.get("/my-learning", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
   const accountId = req.user!.accountId || req.user!.id;
   const memberships = await pool.query(`SELECT m.id,m.status,m.source,m.requested_at,m.approved_at,i.id institution_id,i.name institution_name,i.institution_type,i.city,i.state,i.country FROM institution_memberships m JOIN institutions i ON i.id=m.institution_id WHERE m.user_id=$1 ORDER BY m.requested_at DESC`, [accountId]);
@@ -197,7 +232,7 @@ router.patch("/requests/:id", verifyInstitutionToken, async (req: InstitutionReq
   if (!parsed.success) return res.status(400).json({ success: false, message: "Choose whether to approve or reject this request." });
   try {
     const result = await pool.query(
-      `UPDATE institution_memberships SET status=$1,approved_at=CASE WHEN $1='active' THEN NOW() ELSE NULL END
+      `UPDATE institution_memberships SET status=$1,approved_at=CASE WHEN $1='active' THEN NOW() ELSE NULL END,updated_at=NOW()
        WHERE id=$2 AND institution_id=$3 RETURNING id,status,approved_at`, [parsed.data.status, req.params.id, req.institution!.id],
     );
     if (!result.rows[0]) return res.status(404).json({ success: false, message: "Join request not found." });
