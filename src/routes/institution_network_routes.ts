@@ -128,12 +128,17 @@ router.get("/requests", verifyInstitutionToken, async (req: InstitutionRequest, 
 router.patch("/requests/:id", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
   const parsed = StatusSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ success: false, message: "Choose whether to approve or reject this request." });
-  const result = await pool.query(
-    `UPDATE institution_memberships SET status=$1,approved_at=CASE WHEN $1='active' THEN NOW() ELSE NULL END
-     WHERE id=$2 AND institution_id=$3 RETURNING id,status,approved_at`, [parsed.data.status, req.params.id, req.institution!.id],
-  );
-  if (!result.rows[0]) return res.status(404).json({ success: false, message: "Join request not found." });
-  return res.json({ success: true, message: parsed.data.status === "active" ? "Member approved." : "Join request rejected.", membership: result.rows[0] });
+  try {
+    const result = await pool.query(
+      `UPDATE institution_memberships SET status=$1,approved_at=CASE WHEN $1='active' THEN NOW() ELSE NULL END
+       WHERE id=$2 AND institution_id=$3 RETURNING id,status,approved_at`, [parsed.data.status, req.params.id, req.institution!.id],
+    );
+    if (!result.rows[0]) return res.status(404).json({ success: false, message: "Join request not found." });
+    return res.json({ success: true, message: parsed.data.status === "active" ? "Member approved." : "Join request rejected.", membership: result.rows[0] });
+  } catch (error: any) {
+    console.error("Institution membership status update failed", { requestId: req.params.id, institutionId: req.institution?.id, status: parsed.data.status, error });
+    return res.status(500).json({ success: false, message: "The join request could not be updated. Please try again." });
+  }
 });
 
 export default router;
