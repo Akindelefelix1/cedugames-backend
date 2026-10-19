@@ -17,6 +17,31 @@ const signSession = (account: { id: string; token_version: number }) => jwt.sign
 );
 const accountShape = (row: any) => ({ id: row.id, institutionName: row.name, institutionType: row.institution_type, ownerName: row.owner_name, email: row.email, phone: row.phone, address: row.address, city: row.city, state: row.state, country: row.country, publicAccess: row.is_public, inviteCode: row.invite_code, role: "institution_owner", createdAt: row.created_at });
 
+router.patch("/profile", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
+  const institutionName = String(req.body?.institutionName || "").trim();
+  const email = normalizeEmail(String(req.body?.email || ""));
+  const phone = String(req.body?.phone || "").trim();
+  const address = String(req.body?.address || "").trim() || null;
+  const location = String(req.body?.location || "").trim();
+  if (institutionName.length < 2 || institutionName.length > 160) return res.status(400).json({ success: false, message: "Enter a valid institution name." });
+  if (!/^\S+@\S+\.\S+$/.test(email)) return res.status(400).json({ success: false, message: "Enter a valid institution email." });
+  const [city, state] = location.split(",").map((part: string) => part.trim()).filter(Boolean);
+  try {
+    const result = await pool.query(
+      `UPDATE institutions SET name=$1,email=$2,phone=$3,address=$4,city=$5,state=$6,updated_at=NOW()
+       WHERE id=$7 AND is_active=true
+       RETURNING id,name,institution_type,owner_name,email,phone,address,city,state,country,is_public,invite_code,created_at`,
+      [institutionName, email, phone || null, address, city || null, state || null, req.institution!.id],
+    );
+    if (!result.rows[0]) return res.status(404).json({ success: false, message: "Institution account not found." });
+    return res.json({ success: true, message: "Institution profile updated.", account: accountShape(result.rows[0]) });
+  } catch (error: any) {
+    if (error?.code === "23505") return res.status(409).json({ success: false, message: "An institution account with that email already exists." });
+    console.error("Institution profile update failed", error);
+    return res.status(500).json({ success: false, message: "Institution profile could not be updated." });
+  }
+});
+
 router.post("/register", sensitiveLimiter, async (req, res) => {
   const validation = InstitutionRegisterSchema.safeParse(req.body);
   if (!validation.success) return res.status(400).json({ success: false, message: validation.error.issues[0]?.message || "Enter valid institution details." });
