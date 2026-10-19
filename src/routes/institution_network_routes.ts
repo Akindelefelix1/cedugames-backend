@@ -11,6 +11,7 @@ const StatusSchema = z.object({ status: z.enum(["active", "rejected"]) });
 const StructureSettingsSchema = z.object({ categoryLabel: z.string().trim().min(2).max(80), levelLabel: z.string().trim().min(2).max(80), learnerLabel: z.string().trim().min(2).max(80), subjectLabel: z.string().trim().min(2).max(80) });
 const CategorySchema = z.object({ name: z.string().trim().min(2).max(120), description: z.string().trim().max(500).default(""), sortOrder: z.coerce.number().int().min(0).max(10000).default(0) });
 const LevelSchema = z.object({ categoryId: z.string().uuid(), name: z.string().trim().min(2).max(120), code: z.string().trim().max(80).default(""), learnerCount: z.coerce.number().int().min(0).max(1000000).default(0), subjects: z.array(z.string().trim().min(1).max(120)).max(50).default([]), sortOrder: z.coerce.number().int().min(0).max(10000).default(0) });
+const InstitutionQuestionSchema = z.object({ subject: z.string().trim().min(1).max(120), questionText: z.string().trim().min(1).max(10000), explanation: z.string().trim().max(5000).default(""), options: z.array(z.object({ text: z.string().trim().min(1).max(5000), isCorrect: z.boolean() })).length(4), status: z.enum(["draft", "published"]).default("draft") }).refine(data => data.options.filter(option => option.isCorrect).length === 1, { message: "Exactly one answer option must be correct." });
 const institutionShape = (row: any) => ({ id: row.id, name: row.name, institutionType: row.institution_type, city: row.city, state: row.state, country: row.country, address: row.address, isPublic: row.is_public });
 const categoryShape = (row: any) => ({ id: row.id, name: row.name, description: row.description || "", levels: Number(row.level_count || 0), sortOrder: Number(row.sort_order || 0), tone: row.tone || "purple" });
 const levelShape = (row: any) => ({ id: row.id, categoryId: row.category_id, category: row.category_name, name: row.name, code: row.code || "", learners: Number(row.learner_count || 0), subjects: Array.isArray(row.subjects) ? row.subjects : [], sortOrder: Number(row.sort_order || 0), status: row.is_active ? "Active" : "Inactive", questions: Number(row.question_count || 0), progress: 0 });
@@ -39,7 +40,7 @@ router.get("/structure", verifyInstitutionToken, async (req: InstitutionRequest,
   const [settings, categories, levels] = await Promise.all([
     pool.query("SELECT category_label,level_label,learner_label,subject_label FROM institution_structure_settings WHERE institution_id=$1", [institutionId]),
     pool.query("SELECT c.*,COUNT(l.id)::int level_count FROM institution_categories c LEFT JOIN institution_levels l ON l.category_id=c.id AND l.is_active=true WHERE c.institution_id=$1 AND c.is_active=true GROUP BY c.id ORDER BY c.sort_order,c.created_at", [institutionId]),
-    pool.query(`SELECT l.*,c.name category_name,0::int question_count FROM institution_levels l JOIN institution_categories c ON c.id=l.category_id WHERE l.institution_id=$1 AND l.is_active=true AND c.is_active=true ORDER BY l.sort_order,l.created_at`, [institutionId]),
+    pool.query(`SELECT l.*,c.name category_name,(SELECT COUNT(*)::int FROM institution_questions q WHERE q.level_id=l.id) question_count FROM institution_levels l JOIN institution_categories c ON c.id=l.category_id WHERE l.institution_id=$1 AND l.is_active=true AND c.is_active=true ORDER BY l.sort_order,l.created_at`, [institutionId]),
   ]);
   return res.json({ success: true, labels: settings.rows[0] ? { category: settings.rows[0].category_label, level: settings.rows[0].level_label, learner: settings.rows[0].learner_label, subject: settings.rows[0].subject_label } : { category: "Section", level: "Class", learner: "Learners", subject: "Learning areas" }, categories: categories.rows.map(categoryShape), levels: levels.rows.map(levelShape) });
 });
@@ -49,6 +50,7 @@ router.put("/structure/settings", verifyInstitutionToken, async (req: Institutio
   if (!parsed.success) return res.status(400).json({ success: false, message: "Enter valid names for each structure label." });
   const d = parsed.data;
   const result = await pool.query(`INSERT INTO institution_structure_settings(institution_id,category_label,level_label,learner_label,subject_label) VALUES($1,$2,$3,$4,$5) ON CONFLICT(institution_id) DO UPDATE SET category_label=EXCLUDED.category_label,level_label=EXCLUDED.level_label,learner_label=EXCLUDED.learner_label,subject_label=EXCLUDED.subject_label,updated_at=NOW() RETURNING category_label,level_label,learner_label,subject_label`, [req.institution!.id, d.categoryLabel, d.levelLabel, d.learnerLabel, d.subjectLabel]);
+  await logActivity({ eventType: "institution.structure_settings_updated", title: "Learning structure naming updated", description: "Institution structure labels were updated", metadata: { institutionId: req.institution!.id } });
   return res.json({ success: true, labels: { category: result.rows[0].category_label, level: result.rows[0].level_label, learner: result.rows[0].learner_label, subject: result.rows[0].subject_label } });
 });
 
@@ -58,8 +60,31 @@ router.post("/structure/categories", verifyInstitutionToken, async (req: Institu
   const d = parsed.data;
   try {
     const result = await pool.query("INSERT INTO institution_categories(institution_id,name,description,sort_order) VALUES($1,$2,$3,$4) RETURNING id,name,description,sort_order,is_active", [req.institution!.id, d.name, d.description, d.sortOrder]);
+    await logActivity({ eventType: "institution.category_created", title: "Learning section created", description: `${d.name} was added to the institution structure`, metadata: { institutionId: req.institution!.id, categoryId: result.rows[0].id } });
     return res.status(201).json({ success: true, category: categoryShape(result.rows[0]) });
   } catch (error: any) { return res.status(error?.code === "23505" ? 409 : 500).json({ success: false, message: error?.code === "23505" ? "A category with this name already exists." : "Category could not be created." }); }
+});
+
+router.patch("/structure/categories/:id", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
+  const parsed = CategorySchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ success: false, message: "Enter a valid category name and description." });
+  try {
+    const result = await pool.query("UPDATE institution_categories SET name=$1,description=$2,sort_order=$3,updated_at=NOW() WHERE id=$4 AND institution_id=$5 AND is_active=true RETURNING id,name,description,sort_order,is_active", [parsed.data.name, parsed.data.description, parsed.data.sortOrder, req.params.id, req.institution!.id]);
+    if (!result.rows[0]) return res.status(404).json({ success: false, message: "Section not found." });
+    await logActivity({ eventType: "institution.category_updated", title: "Learning section updated", description: `${parsed.data.name} was updated`, metadata: { institutionId: req.institution!.id, categoryId: req.params.id } });
+    return res.json({ success: true, category: categoryShape(result.rows[0]) });
+  } catch (error: any) { return res.status(error?.code === "23505" ? 409 : 500).json({ success: false, message: error?.code === "23505" ? "A section with this name already exists." : "Section could not be updated." }); }
+});
+
+router.delete("/structure/categories/:id", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
+  try {
+    const levels = await pool.query("SELECT COUNT(*)::int count FROM institution_levels WHERE category_id=$1 AND institution_id=$2 AND is_active=true", [req.params.id, req.institution!.id]);
+    if (Number(levels.rows[0]?.count || 0) > 0) return res.status(409).json({ success: false, message: "Move or delete the classes in this section before deleting it." });
+    const result = await pool.query("DELETE FROM institution_categories WHERE id=$1 AND institution_id=$2 RETURNING id", [req.params.id, req.institution!.id]);
+    if (!result.rows[0]) return res.status(404).json({ success: false, message: "Section not found." });
+    await logActivity({ eventType: "institution.category_deleted", title: "Learning section deleted", description: "An institution learning section was deleted", metadata: { institutionId: req.institution!.id, categoryId: req.params.id } });
+    return res.json({ success: true, message: "Section deleted." });
+  } catch { return res.status(500).json({ success: false, message: "Section could not be deleted." }); }
 });
 
 router.post("/structure/levels", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
@@ -70,8 +95,50 @@ router.post("/structure/levels", verifyInstitutionToken, async (req: Institution
     const category = await pool.query("SELECT id FROM institution_categories WHERE id=$1 AND institution_id=$2 AND is_active=true", [d.categoryId, req.institution!.id]);
     if (!category.rows[0]) return res.status(400).json({ success: false, message: "Select a valid institution category." });
     const result = await pool.query("INSERT INTO institution_levels(institution_id,category_id,name,code,learner_count,subjects,sort_order) VALUES($1,$2,$3,$4,$5,$6::jsonb,$7) RETURNING *", [req.institution!.id, d.categoryId, d.name, d.code, d.learnerCount, JSON.stringify(d.subjects), d.sortOrder]);
+    await logActivity({ eventType: "institution.level_created", title: "Class created", description: `${d.name} was added to the institution structure`, metadata: { institutionId: req.institution!.id, levelId: result.rows[0].id, categoryId: d.categoryId } });
     return res.status(201).json({ success: true, level: levelShape({ ...result.rows[0], category_name: (await pool.query("SELECT name FROM institution_categories WHERE id=$1", [d.categoryId])).rows[0].name, question_count: 0 }) });
   } catch (error: any) { return res.status(error?.code === "23505" ? 409 : 500).json({ success: false, message: error?.code === "23505" ? "A level with this name already exists." : "Level could not be created." }); }
+});
+
+router.patch("/structure/levels/:id", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
+  const parsed = LevelSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ success: false, message: "Enter valid level details." });
+  const d = parsed.data;
+  try {
+    const category = await pool.query("SELECT id,name FROM institution_categories WHERE id=$1 AND institution_id=$2 AND is_active=true", [d.categoryId, req.institution!.id]);
+    if (!category.rows[0]) return res.status(400).json({ success: false, message: "Select a valid institution section." });
+    const result = await pool.query("UPDATE institution_levels SET category_id=$1,name=$2,code=$3,learner_count=$4,subjects=$5::jsonb,sort_order=$6,updated_at=NOW() WHERE id=$7 AND institution_id=$8 AND is_active=true RETURNING *", [d.categoryId, d.name, d.code, d.learnerCount, JSON.stringify(d.subjects), d.sortOrder, req.params.id, req.institution!.id]);
+    if (!result.rows[0]) return res.status(404).json({ success: false, message: "Class not found." });
+    const questionCount = await pool.query("SELECT COUNT(*)::int count FROM institution_questions WHERE level_id=$1", [req.params.id]);
+    await logActivity({ eventType: "institution.level_updated", title: "Class updated", description: `${d.name} was updated`, metadata: { institutionId: req.institution!.id, levelId: req.params.id, categoryId: d.categoryId } });
+    return res.json({ success: true, level: levelShape({ ...result.rows[0], category_name: category.rows[0].name, question_count: questionCount.rows[0]?.count || 0 }) });
+  } catch (error: any) { return res.status(error?.code === "23505" ? 409 : 500).json({ success: false, message: error?.code === "23505" ? "A class with this name already exists." : "Class could not be updated." }); }
+});
+
+router.delete("/structure/levels/:id", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
+  try {
+    const result = await pool.query("DELETE FROM institution_levels WHERE id=$1 AND institution_id=$2 RETURNING id", [req.params.id, req.institution!.id]);
+    if (!result.rows[0]) return res.status(404).json({ success: false, message: "Class not found." });
+    await logActivity({ eventType: "institution.level_deleted", title: "Class deleted", description: "An institution class was deleted", metadata: { institutionId: req.institution!.id, levelId: req.params.id } });
+    return res.json({ success: true, message: "Class deleted." });
+  } catch { return res.status(500).json({ success: false, message: "Class could not be deleted." }); }
+});
+
+router.post("/structure/levels/:id/questions", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
+  const parsed = InstitutionQuestionSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ success: false, message: parsed.error.issues[0]?.message || "Enter a valid question and four answer options." });
+  const level = await pool.query("SELECT id FROM institution_levels WHERE id=$1 AND institution_id=$2 AND is_active=true", [req.params.id, req.institution!.id]);
+  if (!level.rows[0]) return res.status(404).json({ success: false, message: "Class not found." });
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const question = await client.query("INSERT INTO institution_questions(institution_id,level_id,subject,question_text,explanation,status) VALUES($1,$2,$3,$4,$5,$6) RETURNING id,subject,question_text,explanation,status,created_at", [req.institution!.id, req.params.id, parsed.data.subject, parsed.data.questionText, parsed.data.explanation, parsed.data.status]);
+    for (let index = 0; index < parsed.data.options.length; index += 1) { const option = parsed.data.options[index]!; await client.query("INSERT INTO institution_question_options(question_id,option_order,option_text,is_correct) VALUES($1,$2,$3,$4)", [question.rows[0].id, index, option.text, option.isCorrect]); }
+    await client.query("COMMIT");
+    await logActivity({ eventType: "institution.question_created", title: "Institution question created", description: `A question was added to ${parsed.data.subject}`, metadata: { institutionId: req.institution!.id, levelId: req.params.id, subject: parsed.data.subject } });
+    return res.status(201).json({ success: true, question: { ...question.rows[0], options: parsed.data.options } });
+  } catch (error) { await client.query("ROLLBACK"); console.error("Institution question creation failed", error); return res.status(500).json({ success: false, message: "Question could not be saved. Please try again." }); }
+  finally { client.release(); }
 });
 
 router.get("/my-learning", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
@@ -134,6 +201,7 @@ router.patch("/requests/:id", verifyInstitutionToken, async (req: InstitutionReq
        WHERE id=$2 AND institution_id=$3 RETURNING id,status,approved_at`, [parsed.data.status, req.params.id, req.institution!.id],
     );
     if (!result.rows[0]) return res.status(404).json({ success: false, message: "Join request not found." });
+    await logActivity({ eventType: `institution.join_request_${parsed.data.status === "active" ? "approved" : "rejected"}`, title: parsed.data.status === "active" ? "Learner approved" : "Join request rejected", description: parsed.data.status === "active" ? "A learner was approved to join the institution" : "A learner join request was rejected", metadata: { institutionId: req.institution!.id, membershipId: req.params.id } });
     return res.json({ success: true, message: parsed.data.status === "active" ? "Member approved." : "Join request rejected.", membership: result.rows[0] });
   } catch (error: any) {
     console.error("Institution membership status update failed", { requestId: req.params.id, institutionId: req.institution?.id, status: parsed.data.status, error });
