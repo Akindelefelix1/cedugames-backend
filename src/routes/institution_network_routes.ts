@@ -96,7 +96,7 @@ router.post("/:id/join-requests", verifyPlayerToken, async (req: AuthenticatedRe
     if (existing.rows[0]?.status === "active") return res.status(409).json({ success: false, message: "This account already belongs to the institution." });
     if (existing.rows[0]?.status === "pending") return res.status(409).json({ success: false, message: "Your request is already waiting for institution approval." });
     const membership = existing.rows[0]
-      ? await pool.query("UPDATE institution_memberships SET status='pending',source=$1,requested_at=NOW(),approved_at=NULL,updated_at=NOW() WHERE id=$2 RETURNING id,status,requested_at", [source, existing.rows[0].id])
+      ? await pool.query("UPDATE institution_memberships SET status='pending',source=$1,requested_at=NOW(),approved_at=NULL WHERE id=$2 RETURNING id,status,requested_at", [source, existing.rows[0].id])
       : await pool.query("INSERT INTO institution_memberships(institution_id,user_id,status,source) VALUES($1,$2,'pending',$3) RETURNING id,status,requested_at", [target.id, accountId, source]);
     await logActivity({ eventType: "institution.join_requested", title: "Institution join request", description: `A player requested to join ${target.name}`, actorId: accountId, metadata: { institutionId: target.id, membershipId: membership.rows[0].id, source } });
     return res.status(201).json({ success: true, message: `Your request to join ${target.name} has been sent.`, membership: { ...membership.rows[0], institution: institutionShape(target) } });
@@ -129,7 +129,7 @@ router.patch("/requests/:id", verifyInstitutionToken, async (req: InstitutionReq
   const parsed = StatusSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ success: false, message: "Choose whether to approve or reject this request." });
   const result = await pool.query(
-    `UPDATE institution_memberships SET status=$1,approved_at=CASE WHEN $1='active' THEN NOW() ELSE NULL END,updated_at=NOW()
+    `UPDATE institution_memberships SET status=$1,approved_at=CASE WHEN $1='active' THEN NOW() ELSE NULL END
      WHERE id=$2 AND institution_id=$3 RETURNING id,status,approved_at`, [parsed.data.status, req.params.id, req.institution!.id],
   );
   if (!result.rows[0]) return res.status(404).json({ success: false, message: "Join request not found." });
