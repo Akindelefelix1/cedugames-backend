@@ -2,9 +2,9 @@ import { Router } from "express";
 import multer from "multer";
 import { z } from "zod";
 import pool from "../config/database_connection";
-import { verifyAdminToken } from "../middlewares/authentication_middleware";
+import { verifyAdminToken, type AuthenticatedRequest } from "../middlewares/authentication_middleware";
 import { destroyMediaQuietly, uploadMedia } from "../services/cloudinary_media_service";
-import { logActivity } from "../helpers/activityLog";
+import { getAdminActor, logActivity, recordUploadEvent } from "../helpers/activityLog";
 
 const router = Router();
 const imageTypes = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
@@ -50,7 +50,7 @@ router.patch("/admin/family-page/content", verifyAdminToken, async (req, res) =>
   return res.json({ success: true, ...(await readSettings()) });
 });
 
-router.post("/admin/family-page/advert", verifyAdminToken, upload.single("image"), async (req, res) => {
+router.post("/admin/family-page/advert", verifyAdminToken, upload.single("image"), async (req: AuthenticatedRequest, res) => {
   if (!req.file) return res.status(400).json({ success: false, message: "Select an advert image to upload." });
   if (!isImageBuffer(req.file)) return res.status(400).json({ success: false, message: "The selected file is not a valid image." });
   const previous = await pool.query("SELECT advert_image_url FROM family_page_settings WHERE id=1");
@@ -58,7 +58,11 @@ router.post("/admin/family-page/advert", verifyAdminToken, upload.single("image"
   try {
     await pool.query(`INSERT INTO family_page_settings(id,advert_image_url) VALUES(1,$1) ON CONFLICT(id) DO UPDATE SET advert_image_url=$1,updated_at=NOW()`, [media.url]);
     await destroyMediaQuietly(previous.rows[0]?.advert_image_url);
-    await logActivity({ eventType: "family_page.advert_uploaded", title: "Family page advert uploaded", description: req.file.originalname });
+    const actor = await getAdminActor(req);
+    await Promise.all([
+      logActivity({ eventType: "family_page.advert_uploaded", title: "Family page advert uploaded", description: req.file.originalname, actorId: actor.actorId, actorName: actor.actorName, metadata: { imageCount: 1 } }),
+      recordUploadEvent({ ...actor, uploadType: "family_page_advert", imageCount: 1 }),
+    ]);
     return res.status(201).json({ success: true, ...(await readSettings()) });
   } catch (error) { await destroyMediaQuietly(media); throw error; }
 });
@@ -70,7 +74,7 @@ router.delete("/admin/family-page/advert", verifyAdminToken, async (_req, res) =
   return res.json({ success: true, ...(await readSettings()) });
 });
 
-router.post("/admin/family-page/slides", verifyAdminToken, upload.single("image"), async (req, res) => {
+router.post("/admin/family-page/slides", verifyAdminToken, upload.single("image"), async (req: AuthenticatedRequest, res) => {
   if (!req.file) return res.status(400).json({ success: false, message: "Select a slider image to upload." });
   if (!isImageBuffer(req.file)) return res.status(400).json({ success: false, message: "The selected file is not a valid image." });
   const count = await pool.query("SELECT COUNT(*)::int total FROM family_page_slides");
@@ -79,7 +83,11 @@ router.post("/admin/family-page/slides", verifyAdminToken, upload.single("image"
   try {
     const position = (await pool.query("SELECT COALESCE(MAX(position),0)+1 position FROM family_page_slides")).rows[0].position;
     await pool.query("INSERT INTO family_page_slides(image_url,position) VALUES($1,$2)", [media.url, position]);
-    await logActivity({ eventType: "family_page.slide_uploaded", title: "Family page slide uploaded", description: req.file.originalname });
+    const actor = await getAdminActor(req);
+    await Promise.all([
+      logActivity({ eventType: "family_page.slide_uploaded", title: "Family page slide uploaded", description: req.file.originalname, actorId: actor.actorId, actorName: actor.actorName, metadata: { imageCount: 1 } }),
+      recordUploadEvent({ ...actor, uploadType: "family_page_slide", imageCount: 1 }),
+    ]);
     return res.status(201).json({ success: true, ...(await readSettings()) });
   } catch (error) { await destroyMediaQuietly(media); throw error; }
 });

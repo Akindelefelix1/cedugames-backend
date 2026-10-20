@@ -2,8 +2,8 @@ import { Router } from "express";
 import multer from "multer";
 import { z } from "zod";
 import pool from "../config/database_connection";
-import { logActivity } from "../helpers/activityLog";
-import { verifyAdminToken } from "../middlewares/authentication_middleware";
+import { getAdminActor, logActivity, recordUploadEvent } from "../helpers/activityLog";
+import { verifyAdminToken, type AuthenticatedRequest } from "../middlewares/authentication_middleware";
 import { generateQuestionDrafts } from "../services/ai_question_service";
 import { destroyMediaQuietly, StoredMedia, uploadMedia } from "../services/cloudinary_media_service";
 import { assertResourceUrls, destroyOnlyUnmanaged, registerImageResource } from "../helpers/resourceLibrary";
@@ -104,7 +104,7 @@ const parseBulkQuestions = (source: string) => {
   return { errors, questions };
 };
 
-router.post("/admin/questions/bulk", verifyAdminToken, upload.single("file"), async (req, res) => {
+router.post("/admin/questions/bulk", verifyAdminToken, upload.single("file"), async (req: AuthenticatedRequest, res) => {
   const placement = z.object({
     ageGroupId: z.string().uuid().optional(), categoryId: z.string().uuid().optional(), levelId: z.string().uuid().optional(), learningLevelId: z.string().uuid().optional(),
     status: z.enum(["draft", "published"]).default("published"),
@@ -141,7 +141,11 @@ router.post("/admin/questions/bulk", verifyAdminToken, upload.single("file"), as
       }
     }
     await client.query("COMMIT");
-    await logActivity({ eventType: "content.questions_bulk_created", title: "Questions uploaded in bulk", description: `${parsed.questions.length} questions were uploaded` });
+    const actor = await getAdminActor(req);
+    await Promise.all([
+      logActivity({ eventType: "content.questions_bulk_created", title: "Questions uploaded in bulk", description: `${parsed.questions.length} questions were uploaded`, actorId: actor.actorId, actorName: actor.actorName, metadata: { questionCount: parsed.questions.length } }),
+      recordUploadEvent({ ...actor, uploadType: "bulk_questions", questionCount: parsed.questions.length }),
+    ]);
     return res.status(201).json({ success: true, count: parsed.questions.length, message: `${parsed.questions.length} questions uploaded successfully.` });
   } catch (error: any) {
     await client.query("ROLLBACK");
@@ -178,7 +182,7 @@ router.post("/admin/questions/ai/generate", verifyAdminToken, async (req, res) =
   }
 });
 
-router.post("/admin/questions", verifyAdminToken, upload.fields(fields), async (req, res) => {
+router.post("/admin/questions", verifyAdminToken, upload.fields(fields), async (req: AuthenticatedRequest, res) => {
   const fileMap = (req.files || {}) as Record<string, Express.Multer.File[]>;
   if (Object.values(fileMap).flat().some((file) => !isValidImageBuffer(file))) return res.status(400).json({ success: false, message: "One of the selected image files is invalid." });
   const parsed = bodySchema.safeParse(req.body);
@@ -207,7 +211,12 @@ router.post("/admin/questions", verifyAdminToken, upload.fields(fields), async (
     }
     await client.query("COMMIT");
     committed = true;
-    await logActivity({ eventType: "content.question_created", title: "Question created", description: `A ${data.status} question was added` });
+    const actor = await getAdminActor(req);
+    const imageCount = Object.values(fileMap).flat().filter((file) => file.mimetype.startsWith("image/")).length;
+    await Promise.all([
+      logActivity({ eventType: "content.question_created", title: "Question created", description: `A ${data.status} question was added`, actorId: actor.actorId, actorName: actor.actorName, metadata: { questionCount: 1, imageCount } }),
+      recordUploadEvent({ ...actor, uploadType: "question", questionCount: 1, imageCount }),
+    ]);
     return res.status(201).json({ success: true, question: inserted.rows[0] });
   } catch (error) { if (!committed) { await client.query("ROLLBACK"); await cleanupStored(cloudFiles); } throw error; } finally { client.release(); }
 });

@@ -2,8 +2,8 @@ import { Router } from "express";
 import multer from "multer";
 import { z } from "zod";
 import pool from "../config/database_connection";
-import { logActivity } from "../helpers/activityLog";
-import { verifyAdminToken } from "../middlewares/authentication_middleware";
+import { getAdminActor, logActivity, recordUploadEvent } from "../helpers/activityLog";
+import { verifyAdminToken, type AuthenticatedRequest } from "../middlewares/authentication_middleware";
 import { destroyMediaQuietly, uploadMedia } from "../services/cloudinary_media_service";
 
 const router = Router();
@@ -90,7 +90,7 @@ router.get("/admin/resources", verifyAdminToken, async (req, res) => {
   res.json({ success: true, resources: result.rows.map((row: Record<string, any>) => ({ id: row.id, categoryId: row.category_id, categoryName: row.category_name, name: row.name, url: row.url, mimeType: row.mime_type, source: row.source, usageCount: row.usage_count, createdAt: row.created_at })), pagination: { page, pageSize: limit, total, totalPages: Math.ceil(total / limit) } });
 });
 
-router.post("/admin/resources", verifyAdminToken, upload.single("image"), async (req, res) => {
+router.post("/admin/resources", verifyAdminToken, upload.single("image"), async (req: AuthenticatedRequest, res) => {
   if (!req.file) return res.status(400).json({ success: false, message: "Select an image to upload." });
   if (!isImageBuffer(req.file)) return res.status(400).json({ success: false, message: "The selected file is not a valid image." });
   const categoryId = String(req.body.categoryId || "").trim() || null;
@@ -106,7 +106,11 @@ router.post("/admin/resources", verifyAdminToken, upload.single("image"), async 
        VALUES($1,$2,$3,$4,'image',$5,'upload') RETURNING *`,
       [categoryId, String(req.body.name || req.file.originalname).trim().slice(0, 255), media.url, media.publicId || null, req.file.mimetype],
     );
-    await logActivity({ eventType: "resources.image_uploaded", title: "Resource image uploaded", description: result.rows[0].name });
+    const actor = await getAdminActor(req);
+    await Promise.all([
+      logActivity({ eventType: "resources.image_uploaded", title: "Resource image uploaded", description: result.rows[0].name, actorId: actor.actorId, actorName: actor.actorName, metadata: { imageCount: 1 } }),
+      recordUploadEvent({ ...actor, uploadType: "resource_image", imageCount: 1, metadata: { resourceId: result.rows[0].id } }),
+    ]);
     return res.status(201).json({ success: true, resource: result.rows[0] });
   } catch (error) { await destroyMediaQuietly(media); throw error; }
 });

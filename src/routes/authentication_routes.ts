@@ -241,6 +241,41 @@ router.get("/admin/activities", verifyAdminToken, async (req, res) => {
   }
 });
 
+router.get("/admin/upload-analytics", verifyAdminToken, async (req, res) => {
+  const granularity = ["day", "week", "month"].includes(String(req.query.granularity)) ? String(req.query.granularity) : "day";
+  const fallbackFrom = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+  const from = new Date(String(req.query.from || fallbackFrom.toISOString()));
+  const requestedTo = new Date(String(req.query.to || new Date().toISOString()));
+  const to = Number.isNaN(requestedTo.getTime()) ? new Date() : requestedTo;
+  if (Number.isNaN(from.getTime()) || from >= to || to.getTime() - from.getTime() > 366 * 24 * 60 * 60 * 1000) {
+    return res.status(400).json({ success: false, message: "Choose a valid date range of up to 366 days." });
+  }
+  const bucket = granularity === "day" ? "day" : granularity === "week" ? "week" : "month";
+  const values = [from.toISOString(), to.toISOString()];
+  try {
+    const [summary, trend, ranking, recent, admins] = await Promise.all([
+      pool.query(`SELECT COALESCE(SUM(question_count),0)::int total_questions,COALESCE(SUM(image_count),0)::int total_images,COUNT(DISTINCT COALESCE(actor_id::text,actor_name))::int active_admins,COUNT(*)::int upload_events FROM admin_upload_events WHERE created_at >= $1 AND created_at < $2`, values),
+      pool.query(`SELECT date_trunc('${bucket}',created_at) bucket,COALESCE(SUM(question_count),0)::int questions,COALESCE(SUM(image_count),0)::int images FROM admin_upload_events WHERE created_at >= $1 AND created_at < $2 GROUP BY 1 ORDER BY 1`, values),
+      pool.query(`SELECT COALESCE(actor_id::text,'super-admin') admin_id,MAX(actor_name) admin_name,COALESCE(SUM(question_count),0)::int questions,COALESCE(SUM(image_count),0)::int images,COUNT(*)::int upload_events,MAX(created_at) last_upload FROM admin_upload_events WHERE created_at >= $1 AND created_at < $2 GROUP BY 1 ORDER BY questions DESC,images DESC,admin_name`, values),
+      pool.query(`SELECT id,actor_id,actor_name,upload_type,question_count,image_count,metadata,created_at FROM admin_upload_events WHERE created_at >= $1 AND created_at < $2 ORDER BY created_at DESC LIMIT 50`, values),
+      pool.query(`SELECT id,name,email,admin_title title,is_active FROM users WHERE role='admin' ORDER BY name`),
+    ]);
+    const byId = new Map<string, any>(ranking.rows.map((row: Record<string, any>) => [row.admin_id, row] as [string, any]));
+    const leaderboard = [
+      { id: "super-admin", name: "Super Admin", email: env.SUPER_ADMIN_EMAIL, title: "Super Admin", isActive: true },
+      ...admins.rows.map((row: Record<string, any>) => ({ id: row.id, name: row.name, email: row.email, title: row.title, isActive: row.is_active })),
+    ].map((admin) => {
+      const row = byId.get(admin.id);
+      return { ...admin, questions: row?.questions || 0, images: row?.images || 0, uploadEvents: row?.upload_events || 0, lastUpload: row?.last_upload || null };
+    }).sort((a, b) => b.questions - a.questions || b.images - a.images || a.name.localeCompare(b.name));
+    return res.json({ success: true, range: { from: from.toISOString(), to: to.toISOString(), granularity }, summary: summary.rows[0], trend: trend.rows.map((row: Record<string, any>) => ({ bucket: row.bucket, questions: row.questions, images: row.images })), leaderboard, recentUploads: recent.rows });
+  } catch (error: any) {
+    if (error?.code === "42P01") return res.status(503).json({ success: false, message: "Upload tracking is not ready. Run npm run migrate on the backend, then redeploy." });
+    console.error("Admin upload analytics failed", error);
+    return res.status(500).json({ success: false, message: "Upload analytics could not be loaded." });
+  }
+});
+
 const adminPermissions = ["dashboard","user-management","content","leaderboard","coin-system","airtime","daily-rewards","categories","notifications","settings","admins"] as const;
 const createAdminSchema = z.object({
   name: z.string().trim().min(2).max(120), email: z.string().trim().email(),
