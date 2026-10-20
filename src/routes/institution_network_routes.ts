@@ -218,6 +218,30 @@ router.get("/my-memberships", verifyPlayerToken, async (req: AuthenticatedReques
   return res.json({ success: true, memberships: result.rows });
 });
 
+router.delete("/my-memberships/:id", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
+  const accountId = req.user!.accountId || req.user!.id;
+  try {
+    const result = await pool.query(
+      `DELETE FROM institution_memberships
+       WHERE id=$1 AND user_id=$2 AND status='pending'
+       RETURNING id,institution_id`,
+      [req.params.id, accountId],
+    );
+    if (!result.rows[0]) return res.status(404).json({ success: false, message: "Only pending join requests can be canceled." });
+    await logActivity({
+      eventType: "institution.join_request_canceled",
+      title: "Institution join request canceled",
+      description: "A player canceled their pending institution join request",
+      actorId: accountId,
+      metadata: { institutionId: result.rows[0].institution_id, membershipId: result.rows[0].id },
+    });
+    return res.json({ success: true, message: "Your institution request was canceled." });
+  } catch (error) {
+    console.error("Institution join request cancellation failed", { requestId: req.params.id, accountId, error });
+    return res.status(500).json({ success: false, message: "Your join request could not be canceled. Please try again." });
+  }
+});
+
 router.get("/requests", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
   const result = await pool.query(
     `SELECT m.id,m.status,m.source,m.requested_at,m.approved_at,u.id user_id,u.name,u.username,u.email
