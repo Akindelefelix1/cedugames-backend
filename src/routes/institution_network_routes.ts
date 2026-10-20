@@ -4,9 +4,12 @@ import pool from "../config/database_connection";
 import { verifyPlayerToken, type AuthenticatedRequest } from "../middlewares/authentication_middleware";
 import { verifyInstitutionToken, type InstitutionRequest } from "../middlewares/institution_authentication_middleware";
 import { logActivity } from "../helpers/activityLog";
+import { SendInstitutionInvitation } from "../helpers/Mailer";
+import { env } from "../config/env";
 
 const router = Router();
 const JoinSchema = z.object({ inviteCode: z.string().trim().max(20).optional().or(z.literal("")) });
+const InvitationSchema = z.object({ target: z.string().trim().min(7).max(320) });
 const StatusSchema = z.object({ status: z.enum(["active", "rejected"]) });
 const StructureSettingsSchema = z.object({ categoryLabel: z.string().trim().min(2).max(80), levelLabel: z.string().trim().min(2).max(80), learnerLabel: z.string().trim().min(2).max(80), subjectLabel: z.string().trim().min(2).max(80) });
 const CategorySchema = z.object({ name: z.string().trim().min(2).max(120), description: z.string().trim().max(500).default(""), sortOrder: z.coerce.number().int().min(0).max(10000).default(0) });
@@ -251,15 +254,37 @@ router.get("/requests", verifyInstitutionToken, async (req: InstitutionRequest, 
   return res.json({ success: true, requests: result.rows });
 });
 
+router.post("/invitations", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
+  const parsed = InvitationSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ success: false, message: "Enter a valid email address or phone number." });
+  const target = parsed.data.target.trim();
+  const isEmail = /^\S+@\S+\.\S+$/.test(target);
+  const isPhone = /^\+?[1-9]\d{6,14}$/.test(target.replace(/[\s()-]/g, ""));
+  if (!isEmail && !isPhone) return res.status(400).json({ success: false, message: "Enter a valid email address or international phone number." });
+  const channel = isEmail ? "email" : "phone";
+  const institution = await pool.query("SELECT id,name,invite_code FROM institutions WHERE id=$1 AND is_active=true", [req.institution!.id]);
+  if (!institution.rows[0]) return res.status(404).json({ success: false, message: "Institution not found." });
+  const inviteLink = `${env.USER_APP_URL}/institutions?code=${encodeURIComponent(institution.rows[0].invite_code)}`;
+  try {
+    if (isEmail) await SendInstitutionInvitation(target.toLowerCase(), institution.rows[0].name, inviteLink);
+    const saved = await pool.query("INSERT INTO institution_invitations(institution_id,target,channel) VALUES($1,$2,$3) RETURNING id,channel,created_at", [req.institution!.id, isEmail ? target.toLowerCase() : target.replace(/[\s()-]/g, ""), channel]);
+    await logActivity({ eventType: "institution.invitation_sent", title: "Institution invitation sent", description: `An institution invitation was prepared for a ${channel} contact`, metadata: { institutionId: req.institution!.id, invitationId: saved.rows[0].id, channel } });
+    return res.status(201).json({ success: true, channel, inviteLink, message: isEmail ? "Invitation email sent." : "SMS invitation ready to send." });
+  } catch (error: any) {
+    console.error("Institution invitation failed", { institutionId: req.institution!.id, channel, error });
+    return res.status(502).json({ success: false, message: isEmail ? "Invitation email could not be sent. Check email delivery settings." : "The phone invitation could not be prepared." });
+  }
+});
+
 router.patch("/requests/:id", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
   const parsed = StatusSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ success: false, message: "Choose whether to approve or reject this request." });
   try {
     const result = await pool.query(
       `UPDATE institution_memberships SET status=$1,approved_at=CASE WHEN $1='active' THEN NOW() ELSE NULL END,updated_at=NOW()
-       WHERE id=$2 AND institution_id=$3 RETURNING id,status,approved_at`, [parsed.data.status, req.params.id, req.institution!.id],
+       WHERE id=$2 AND institution_id=$3 AND status='pending' RETURNING id,status,approved_at`, [parsed.data.status, req.params.id, req.institution!.id],
     );
-    if (!result.rows[0]) return res.status(404).json({ success: false, message: "Join request not found." });
+    if (!result.rows[0]) return res.status(409).json({ success: false, message: "This join request is no longer pending." });
     await logActivity({ eventType: `institution.join_request_${parsed.data.status === "active" ? "approved" : "rejected"}`, title: parsed.data.status === "active" ? "Learner approved" : "Join request rejected", description: parsed.data.status === "active" ? "A learner was approved to join the institution" : "A learner join request was rejected", metadata: { institutionId: req.institution!.id, membershipId: req.params.id } });
     return res.json({ success: true, message: parsed.data.status === "active" ? "Member approved." : "Join request rejected.", membership: result.rows[0] });
   } catch (error: any) {

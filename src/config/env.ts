@@ -14,6 +14,7 @@ const EnvSchema = z.object({
   MAIL_SEND_TIMEOUT_MS: z.coerce.number().int().min(1000).max(120000).default(10000),
   EMAIL_VERIFICATION_ENABLED: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),
   CORS_ORIGINS: z.string().default("http://localhost:3000,http://localhost:5173,https://cedugames-admin.onrender.com,https://cedugames-user.onrender.com"),
+  USER_APP_URL: z.string().url().default("https://cedugames-user.onrender.com"),
   SUPER_ADMIN_EMAIL: z.string().email().default("cedugames@gmail.com"),
   SUPER_ADMIN_PASSWORD: z.string().min(10).default("Admin@1234"),
   FLW_SECRET_KEY: z.string().default(""),
