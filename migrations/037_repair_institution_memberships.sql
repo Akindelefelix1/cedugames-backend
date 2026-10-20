@@ -3,9 +3,6 @@ ALTER TABLE institution_memberships
   ADD COLUMN IF NOT EXISTS approved_at timestamptz,
   ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();
 
--- Older deployments used "approved" while the current API uses "active".
-UPDATE institution_memberships SET status = 'active' WHERE status = 'approved';
-
 DO $$
 DECLARE
   constraint_name text;
@@ -19,11 +16,14 @@ BEGIN
   LOOP
     EXECUTE format('ALTER TABLE institution_memberships DROP CONSTRAINT %I', constraint_name);
   END LOOP;
-
-  ALTER TABLE institution_memberships
-    ADD CONSTRAINT institution_memberships_status_check
-    CHECK (status IN ('pending', 'active', 'rejected'));
 END $$;
+
+-- Remove legacy values only after the old status constraint is gone.
+UPDATE institution_memberships SET status = 'active' WHERE status = 'approved';
+
+ALTER TABLE institution_memberships
+  ADD CONSTRAINT institution_memberships_status_check
+  CHECK (status IN ('pending', 'active', 'rejected'));
 
 -- migrate:down
 ALTER TABLE institution_memberships DROP CONSTRAINT IF EXISTS institution_memberships_status_check;
