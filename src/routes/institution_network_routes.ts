@@ -1,4 +1,5 @@
 import { Router } from "express";
+import multer from "multer";
 import { z } from "zod";
 import pool from "../config/database_connection";
 import { verifyPlayerToken, type AuthenticatedRequest } from "../middlewares/authentication_middleware";
@@ -6,6 +7,8 @@ import { verifyInstitutionToken, type InstitutionRequest } from "../middlewares/
 import { logActivity } from "../helpers/activityLog";
 import { SendInstitutionInvitation } from "../helpers/Mailer";
 import { env } from "../config/env";
+import { destroyMediaQuietly, StoredMedia, uploadMedia } from "../services/cloudinary_media_service";
+import { cleanRichText, plainText } from "../helpers/htmlSanitizer";
 
 const router = Router();
 const JoinSchema = z.object({ inviteCode: z.string().trim().max(20).optional().or(z.literal("")) });
@@ -14,7 +17,21 @@ const StatusSchema = z.object({ status: z.enum(["active", "rejected"]) });
 const StructureSettingsSchema = z.object({ categoryLabel: z.string().trim().min(2).max(80), levelLabel: z.string().trim().min(2).max(80), learnerLabel: z.string().trim().min(2).max(80), subjectLabel: z.string().trim().min(2).max(80) });
 const CategorySchema = z.object({ name: z.string().trim().min(2).max(120), description: z.string().trim().max(500).default(""), sortOrder: z.coerce.number().int().min(0).max(10000).default(0) });
 const LevelSchema = z.object({ categoryId: z.string().uuid(), name: z.string().trim().min(2).max(120), code: z.string().trim().max(80).default(""), learnerCount: z.coerce.number().int().min(0).max(1000000).default(0), subjects: z.array(z.string().trim().min(1).max(120)).max(50).default([]), sortOrder: z.coerce.number().int().min(0).max(10000).default(0) });
-const InstitutionQuestionSchema = z.object({ subject: z.string().trim().min(1).max(120), questionText: z.string().trim().min(1).max(10000), explanation: z.string().trim().max(5000).default(""), options: z.array(z.object({ text: z.string().trim().min(1).max(5000), isCorrect: z.boolean() })).length(4), status: z.enum(["draft", "published"]).default("draft") }).refine(data => data.options.filter(option => option.isCorrect).length === 1, { message: "Exactly one answer option must be correct." });
+const institutionQuestionUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024, files: 5 }, fileFilter: (_req, file, done) => { const allowed = ["image/jpeg", "image/png", "image/gif", "image/webp", "audio/mpeg", "audio/wav", "audio/x-wav", "audio/ogg", "audio/mp4", "audio/x-m4a", "audio/aac", "video/mp4", "video/webm", "video/quicktime", "application/pdf", "text/plain", "application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"]; if (allowed.includes(file.mimetype)) done(null, true); else done(new Error("Unsupported question media type.")); } });
+const institutionQuestionFields = [{ name: "questionMedia", maxCount: 1 }, ...Array.from({ length: 4 }, (_, index) => ({ name: `optionMedia${index}`, maxCount: 1 }))];
+const validInstitutionQuestionImage = (file: Express.Multer.File) => {
+  if (!file.mimetype.startsWith("image/")) return true;
+  const bytes = file.buffer;
+  if (file.mimetype === "image/jpeg") return bytes.length > 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+  if (file.mimetype === "image/png") return bytes.length > 8 && bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  if (file.mimetype === "image/gif") return ["GIF87a", "GIF89a"].includes(bytes.subarray(0, 6).toString("ascii"));
+  if (file.mimetype === "image/webp") return bytes.subarray(0, 4).toString("ascii") === "RIFF" && bytes.subarray(8, 12).toString("ascii") === "WEBP";
+  return false;
+};
+const institutionShapeSchema = z.object({ type: z.enum(["circle", "square", "rectangle", "triangle", "star", "hexagon"]), color: z.string().regex(/^#[0-9a-fA-F]{6}$/) }).nullable();
+const jsonShape = z.string().transform((value, ctx) => { try { return institutionShapeSchema.parse(JSON.parse(value)); } catch { ctx.addIssue({ code: "custom", message: "Invalid shape selection." }); return z.NEVER; } });
+const institutionOptionSchema = z.object({ text: z.string().trim().max(5000), isCorrect: z.boolean(), mediaType: z.enum(["image", "audio", "video", "document"]).nullable(), shape: jsonShape });
+const InstitutionQuestionSchema = z.object({ subject: z.string().trim().min(1).max(120), questionText: z.string().max(10000).default(""), explanation: z.string().max(5000).default(""), questionShape: jsonShape, questionMediaType: z.enum(["", "image", "audio", "video", "document"]).default(""), readAloud: z.enum(["true", "false"]).default("false").transform(value => value === "true"), options: z.string().transform((value, ctx) => { try { return z.array(institutionOptionSchema).length(4).parse(JSON.parse(value)); } catch { ctx.addIssue({ code: "custom", message: "Four valid answer options are required." }); return z.NEVER; } }), status: z.enum(["draft", "published"]).default("draft") }).refine(data => data.options.filter(option => option.isCorrect).length === 1, { message: "Exactly one answer option must be marked correct." });
 const institutionShape = (row: any) => ({ id: row.id, name: row.name, institutionType: row.institution_type, city: row.city, state: row.state, country: row.country, address: row.address, isPublic: row.is_public });
 const categoryShape = (row: any) => ({ id: row.id, name: row.name, description: row.description || "", levels: Number(row.level_count || 0), sortOrder: Number(row.sort_order || 0), tone: row.tone || "purple" });
 const levelShape = (row: any) => ({ id: row.id, categoryId: row.category_id, category: row.category_name, name: row.name, code: row.code || "", learners: Number(row.learner_count || 0), subjects: Array.isArray(row.subjects) ? row.subjects : [], sortOrder: Number(row.sort_order || 0), status: row.is_active ? "Active" : "Inactive", questions: Number(row.question_count || 0), progress: 0 });
@@ -127,32 +144,63 @@ router.delete("/structure/levels/:id", verifyInstitutionToken, async (req: Insti
   } catch { return res.status(500).json({ success: false, message: "Class could not be deleted." }); }
 });
 
-router.post("/structure/levels/:id/questions", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
+router.post("/structure/levels/:id/questions", verifyInstitutionToken, institutionQuestionUpload.fields(institutionQuestionFields), async (req: InstitutionRequest, res) => {
   const parsed = InstitutionQuestionSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ success: false, message: parsed.error.issues[0]?.message || "Enter a valid question and four answer options." });
+  const files = (req.files || {}) as Record<string, Express.Multer.File[]>;
+  if (Object.values(files).flat().some(file => !validInstitutionQuestionImage(file))) return res.status(400).json({ success: false, message: "One of the selected images is invalid." });
+  const questionFile = files.questionMedia?.[0];
+  const optionFiles = parsed.data.options.map((_, index) => files[`optionMedia${index}`]?.[0]);
+  const questionText = cleanRichText(parsed.data.questionText);
+  const optionTexts = parsed.data.options.map(option => cleanRichText(option.text));
+  if (!plainText(questionText) && !questionFile && !parsed.data.questionShape) return res.status(400).json({ success: false, message: "Add question text, media, or a shape." });
+  if (parsed.data.options.some((option, index) => !plainText(optionTexts[index] || "") && !optionFiles[index] && !option.shape)) return res.status(400).json({ success: false, message: "Every answer option needs text, media, or a shape." });
   const level = await pool.query("SELECT id FROM institution_levels WHERE id=$1 AND institution_id=$2 AND is_active=true", [req.params.id, req.institution!.id]);
   if (!level.rows[0]) return res.status(404).json({ success: false, message: "Class not found." });
   const client = await pool.connect();
+  const stored: StoredMedia[] = [];
+  let committed = false;
   try {
+    const mediaFiles = [questionFile, ...optionFiles];
+    const uploaded: (StoredMedia | null)[] = [];
+    for (const file of mediaFiles) { const item = file ? await uploadMedia(file, "institution-questions") : null; uploaded.push(item); if (item) stored.push(item); }
     await client.query("BEGIN");
-    const question = await client.query("INSERT INTO institution_questions(institution_id,level_id,subject,question_text,explanation,status) VALUES($1,$2,$3,$4,$5,$6) RETURNING id,subject,question_text,explanation,status,created_at", [req.institution!.id, req.params.id, parsed.data.subject, parsed.data.questionText, parsed.data.explanation, parsed.data.status]);
-    for (let index = 0; index < parsed.data.options.length; index += 1) { const option = parsed.data.options[index]!; await client.query("INSERT INTO institution_question_options(question_id,option_order,option_text,is_correct) VALUES($1,$2,$3,$4)", [question.rows[0].id, index, option.text, option.isCorrect]); }
+    const shape = parsed.data.questionShape;
+    const question = await client.query(
+      "INSERT INTO institution_questions(institution_id,level_id,subject,question_text,explanation,status,media_url,media_type,read_aloud,shape_type,shape_color) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id,subject,question_text,explanation,status,created_at,media_url,media_type,read_aloud,shape_type,shape_color",
+      [req.institution!.id, req.params.id, parsed.data.subject, questionText, parsed.data.explanation, parsed.data.status, uploaded[0]?.url || null, questionFile ? parsed.data.questionMediaType : null, parsed.data.readAloud, shape?.type || null, shape?.color || null],
+    );
+    for (let index = 0; index < parsed.data.options.length; index += 1) {
+      const option = parsed.data.options[index]!;
+      const optionShape = option.shape;
+      await client.query(
+        "INSERT INTO institution_question_options(question_id,option_order,option_text,is_correct,media_url,media_type,shape_type,shape_color) VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
+        [question.rows[0].id, index, optionTexts[index], option.isCorrect, uploaded[index + 1]?.url || null, optionFiles[index] ? option.mediaType : null, optionShape?.type || null, optionShape?.color || null],
+      );
+    }
     await client.query("COMMIT");
-    await logActivity({ eventType: "institution.question_created", title: "Institution question created", description: `A question was added to ${parsed.data.subject}`, metadata: { institutionId: req.institution!.id, levelId: req.params.id, subject: parsed.data.subject } });
-    return res.status(201).json({ success: true, question: { ...question.rows[0], options: parsed.data.options } });
-  } catch (error) { await client.query("ROLLBACK"); console.error("Institution question creation failed", error); return res.status(500).json({ success: false, message: "Question could not be saved. Please try again." }); }
-  finally { client.release(); }
+    committed = true;
+    try { await logActivity({ eventType: "institution.question_created", title: "Institution question created", description: `A question was added to ${parsed.data.subject}`, metadata: { institutionId: req.institution!.id, levelId: req.params.id, subject: parsed.data.subject } }); }
+    catch (activityError) { console.error("Institution question activity log failed", activityError); }
+    return res.status(201).json({ success: true, question: { ...question.rows[0], options: parsed.data.options.map((option, index) => ({ text: optionTexts[index], isCorrect: option.isCorrect, mediaUrl: uploaded[index + 1]?.url || null, mediaType: optionFiles[index] ? option.mediaType : null, shapeType: option.shape?.type || null, shapeColor: option.shape?.color || null })) } });
+  } catch (error) {
+    if (!committed) { await client.query("ROLLBACK"); await Promise.all(stored.map(destroyMediaQuietly)); }
+    console.error("Institution question creation failed", error);
+    return res.status(500).json({ success: false, message: "Question could not be saved. Please try again." });
+  } finally { client.release(); }
 });
-
 router.get("/questions", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
-  const result = await pool.query(`SELECT q.id,q.subject,q.question_text,q.explanation,q.status,q.created_at,q.updated_at,COALESCE(json_agg(json_build_object('text',o.option_text,'isCorrect',o.is_correct) ORDER BY o.option_order) FILTER (WHERE o.id IS NOT NULL),'[]') options,l.name level_name,c.name category_name FROM institution_questions q JOIN institution_levels l ON l.id=q.level_id JOIN institution_categories c ON c.id=l.category_id LEFT JOIN institution_question_options o ON o.question_id=q.id WHERE q.institution_id=$1 GROUP BY q.id,l.name,c.name ORDER BY q.created_at DESC`, [req.institution!.id]);
-  return res.json({ success: true, questions: result.rows.map((row: Record<string, any>) => ({ id: row.id, text: row.question_text, explanation: row.explanation, subject: row.subject, level: row.level_name, section: row.category_name, type: "Multiple choice", status: row.status === "published" ? "Published" : "Draft", updated: row.updated_at, plays: 0, options: row.options })) });
+  const result = await pool.query(`SELECT q.id,q.subject,q.question_text,q.explanation,q.status,q.created_at,q.updated_at,q.media_url,q.media_type,q.read_aloud,q.shape_type,q.shape_color,COALESCE(json_agg(json_build_object('text',o.option_text,'isCorrect',o.is_correct,'mediaUrl',o.media_url,'mediaType',o.media_type,'shapeType',o.shape_type,'shapeColor',o.shape_color) ORDER BY o.option_order) FILTER (WHERE o.id IS NOT NULL),'[]') options,l.name level_name,c.name category_name FROM institution_questions q JOIN institution_levels l ON l.id=q.level_id JOIN institution_categories c ON c.id=l.category_id LEFT JOIN institution_question_options o ON o.question_id=q.id WHERE q.institution_id=$1 GROUP BY q.id,l.name,c.name ORDER BY q.created_at DESC`, [req.institution!.id]);
+  return res.json({ success: true, questions: result.rows.map((row: Record<string, any>) => ({ id: row.id, text: row.question_text, explanation: row.explanation, subject: row.subject, level: row.level_name, section: row.category_name, type: "Multiple choice", status: row.status === "published" ? "Published" : "Draft", updated: row.updated_at, plays: 0, mediaUrl: row.media_url, mediaType: row.media_type, readAloud: row.read_aloud, shapeType: row.shape_type, shapeColor: row.shape_color, options: row.options })) });
 });
 
 router.delete("/questions/:id", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
-  const result = await pool.query("DELETE FROM institution_questions WHERE id=$1 AND institution_id=$2 RETURNING id,subject,level_id", [req.params.id, req.institution!.id]);
+  const stored = await pool.query(`SELECT q.id,q.subject,q.level_id,q.media_url,COALESCE(array_agg(o.media_url) FILTER (WHERE o.media_url IS NOT NULL),ARRAY[]::text[]) option_media FROM institution_questions q LEFT JOIN institution_question_options o ON o.question_id=q.id WHERE q.id=$1 AND q.institution_id=$2 GROUP BY q.id`, [req.params.id, req.institution!.id]);
+  if (!stored.rows[0]) return res.status(404).json({ success: false, message: "Question not found." });
+  const result = await pool.query("DELETE FROM institution_questions WHERE id=$1 AND institution_id=$2 RETURNING id", [req.params.id, req.institution!.id]);
   if (!result.rows[0]) return res.status(404).json({ success: false, message: "Question not found." });
-  await logActivity({ eventType: "institution.question_deleted", title: "Institution question deleted", description: `A question was removed from ${result.rows[0].subject}`, metadata: { institutionId: req.institution!.id, levelId: result.rows[0].level_id } });
+  await Promise.all([stored.rows[0].media_url, ...(stored.rows[0].option_media || [])].filter(Boolean).map(destroyMediaQuietly));
+  await logActivity({ eventType: "institution.question_deleted", title: "Institution question deleted", description: `A question was removed from ${stored.rows[0].subject}`, metadata: { institutionId: req.institution!.id, levelId: stored.rows[0].level_id } });
   return res.json({ success: true, message: "Question deleted." });
 });
 
@@ -177,6 +225,71 @@ router.get("/dashboard", verifyInstitutionToken, async (req: InstitutionRequest,
 router.get("/students", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
   const result = await pool.query(`SELECT m.id,u.name,u.username,u.email,m.status,m.approved_at FROM institution_memberships m JOIN users u ON u.id=m.user_id WHERE m.institution_id=$1 AND m.status='active' ORDER BY u.name`, [req.institution!.id]);
   return res.json({ success: true, students: result.rows.map((row: Record<string, any>) => ({ id: row.id, name: row.name, username: row.username, email: row.email, className: "Not assigned", progress: 0, lastSeen: row.approved_at ? new Date(row.approved_at).toLocaleDateString() : "Not available", status: "Active", initials: String(row.name || "IN").split(/\s+/).map(part => part[0]).join("").slice(0, 2).toUpperCase() })) });
+});
+
+router.get("/students/:studentId", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
+  const parsedId = z.string().uuid().safeParse(req.params.studentId);
+  if (!parsedId.success) return res.status(404).json({ success: false, message: "Student not found in this institution." });
+  const membership = await pool.query(
+    `SELECT m.id,m.status,COALESCE(m.approved_at,m.requested_at) joined_at,u.id user_id,u.name,u.username,u.email,u.phone,u.age,u.total_xp,u.created_at,
+       (SELECT MAX(a.created_at) FROM gameplay_attempts a WHERE a.user_id=u.id) last_active
+     FROM institution_memberships m JOIN users u ON u.id=m.user_id
+     WHERE m.id=$1 AND m.institution_id=$2 AND m.status='active'`,
+    [parsedId.data, req.institution!.id],
+  );
+  if (!membership.rows[0]) return res.status(404).json({ success: false, message: "Student not found in this institution." });
+  const userId = membership.rows[0].user_id;
+  const [summary, activity] = await Promise.all([
+    pool.query(`SELECT COUNT(*)::int attempts,COUNT(*) FILTER (WHERE passed)::int passed,ROUND(AVG(score_percent))::int average_score FROM gameplay_attempts WHERE user_id=$1`, [userId]),
+    pool.query(`SELECT a.id,a.score_percent,a.passed,a.created_at,COALESCE(g.name,l.title,'Learning activity') level_name FROM gameplay_attempts a LEFT JOIN game_levels g ON g.id=a.level_id LEFT JOIN learning_items l ON l.id=a.learning_level_id WHERE a.user_id=$1 ORDER BY a.created_at DESC LIMIT 10`, [userId]),
+  ]);
+  const row = membership.rows[0];
+  return res.json({
+    success: true,
+    student: { id: row.id, name: row.name, username: row.username, email: row.email, phone: row.phone, age: row.age, totalXp: Number(row.total_xp || 0), status: row.status === "active" ? "Active" : row.status, joinedAt: row.joined_at, lastPracticeAt: row.last_active, initials: String(row.name || "IN").split(/\s+/).map(part => part[0]).join("").slice(0, 2).toUpperCase() },
+    summary: { attempts: Number(summary.rows[0]?.attempts || 0), passed: Number(summary.rows[0]?.passed || 0), averageScore: summary.rows[0]?.average_score == null ? null : Number(summary.rows[0].average_score) },
+    recentActivity: activity.rows.map((item: Record<string, any>) => ({ id: item.id, activity: item.passed ? "Passed practice" : "Completed practice", levelName: item.level_name, score: Number(item.score_percent), passed: item.passed, createdAt: item.created_at })),
+  });
+});
+router.get("/my-learning/:institutionId", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
+  const parsedId = z.string().uuid().safeParse(req.params.institutionId);
+  if (!parsedId.success) return res.status(404).json({ success: false, message: "Institution not found." });
+  const accountId = req.user!.accountId || req.user!.id;
+  const membership = await pool.query(
+    `SELECT i.id,i.name,i.institution_type,i.city,i.state
+     FROM institution_memberships m JOIN institutions i ON i.id=m.institution_id
+     WHERE m.user_id=$1 AND m.institution_id=$2 AND m.status='active' AND i.is_active=true`,
+    [accountId, parsedId.data],
+  );
+  if (!membership.rows[0]) return res.status(404).json({ success: false, message: "Active institution membership not found." });
+  const [levels, questions] = await Promise.all([
+    pool.query(`SELECT l.id,l.name,l.code,l.subjects,c.name category_name FROM institution_levels l JOIN institution_categories c ON c.id=l.category_id WHERE l.institution_id=$1 AND l.is_active=true AND c.is_active=true ORDER BY c.sort_order,l.sort_order,l.name`, [parsedId.data]),
+    pool.query(`SELECT q.id,q.level_id,q.subject,q.question_text,q.media_url,q.media_type,q.read_aloud,q.shape_type,q.shape_color,q.created_at,COALESCE(json_agg(json_build_object('text',o.option_text,'mediaUrl',o.media_url,'mediaType',o.media_type,'shapeType',o.shape_type,'shapeColor',o.shape_color) ORDER BY o.option_order) FILTER (WHERE o.id IS NOT NULL),'[]') options FROM institution_questions q JOIN institution_levels l ON l.id=q.level_id AND l.is_active=true JOIN institution_categories c ON c.id=l.category_id AND c.is_active=true LEFT JOIN institution_question_options o ON o.question_id=q.id WHERE q.institution_id=$1 AND q.status='published' GROUP BY q.id ORDER BY q.created_at DESC`, [parsedId.data]),
+  ]);
+  return res.json({
+    success: true,
+    institution: { id: membership.rows[0].id, name: membership.rows[0].name, institutionType: membership.rows[0].institution_type, city: membership.rows[0].city, state: membership.rows[0].state },
+    levels: levels.rows.map((row: Record<string, any>) => ({ id: row.id, name: row.name, code: row.code, category: row.category_name, subjects: Array.isArray(row.subjects) ? row.subjects : [] })),
+    questions: questions.rows.map((row: Record<string, any>) => ({ id: row.id, levelId: row.level_id, subject: row.subject, text: row.question_text, mediaUrl: row.media_url, mediaType: row.media_type, readAloud: row.read_aloud, shapeType: row.shape_type, shapeColor: row.shape_color, options: row.options })),
+  });
+});
+
+router.post("/my-learning/:institutionId/questions/:questionId/answer", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
+  const institutionId = z.string().uuid().safeParse(req.params.institutionId);
+  const questionId = z.string().uuid().safeParse(req.params.questionId);
+  const answer = z.object({ optionIndex: z.coerce.number().int().min(0).max(3) }).safeParse(req.body || {});
+  if (!institutionId.success || !questionId.success || !answer.success) return res.status(400).json({ success: false, message: "Choose one of the available answers." });
+  const accountId = req.user!.accountId || req.user!.id;
+  const result = await pool.query(
+    `SELECT o.is_correct,q.explanation
+     FROM institution_questions q JOIN institution_question_options o ON o.question_id=q.id AND o.option_order=$3
+     WHERE q.id=$1 AND q.institution_id=$2 AND q.status='published'
+       AND EXISTS (SELECT 1 FROM institution_memberships m WHERE m.institution_id=$2 AND m.user_id=$4 AND m.status='active')`,
+    [questionId.data, institutionId.data, answer.data.optionIndex, accountId],
+  );
+  if (!result.rows[0]) return res.status(404).json({ success: false, message: "Published question not found." });
+  const correct = Boolean(result.rows[0].is_correct);
+  return res.json({ success: true, correct, explanation: correct ? result.rows[0].explanation : null });
 });
 
 router.get("/my-learning", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
