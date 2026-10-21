@@ -281,7 +281,7 @@ router.patch("/requests/:id", verifyInstitutionToken, async (req: InstitutionReq
   if (!parsed.success) return res.status(400).json({ success: false, message: "Choose whether to approve or reject this request." });
   try {
     const result = await pool.query(
-      `UPDATE institution_memberships SET status=$1,approved_at=CASE WHEN $1='active' THEN NOW() ELSE NULL END
+      `UPDATE institution_memberships SET status=$1::varchar,approved_at=CASE WHEN $1::text='active' THEN NOW() ELSE NULL END
        WHERE id=$2 AND institution_id=$3 AND status='pending' RETURNING id,status,approved_at`, [parsed.data.status, req.params.id, req.institution!.id],
     );
     if (!result.rows[0]) return res.status(409).json({ success: false, message: "This join request is no longer pending." });
