@@ -5,12 +5,13 @@ import { z } from "zod";
 import pool from "../config/database_connection";
 import { verifyPlayerToken, type AuthenticatedRequest } from "../middlewares/authentication_middleware";
 import { verifyInstitutionToken, type InstitutionRequest } from "../middlewares/institution_authentication_middleware";
-import { logActivity, purgeExpiredInstitutionActivity } from "../helpers/activityLog";
+import { logActivity, purgeExpiredInstitutionActivity, purgeExpiredInstitutionLearningHistory } from "../helpers/activityLog";
 import { SendInstitutionInvitation } from "../helpers/Mailer";
 import { env } from "../config/env";
 import { destroyMediaQuietly, StoredMedia, uploadMedia } from "../services/cloudinary_media_service";
 import { cleanRichText, plainText } from "../helpers/htmlSanitizer";
 import { generateQuestionDrafts } from "../services/ai_question_service";
+import { recordCoinTransaction } from "../services/coin_service";
 
 const router = Router();
 const JoinSchema = z.object({ inviteCode: z.string().trim().max(20).optional().or(z.literal("")) });
@@ -530,20 +531,55 @@ router.post("/my-learning/:institutionId/practice", verifyPlayerToken, async (re
   const parsed = InstitutionPracticeStartSchema.safeParse(req.body || {});
   if (!institutionId.success || !parsed.success) return res.status(400).json({ success: false, message: "Choose a valid learning placement and area." });
   const playerId = req.user!.id;
-  const membership = await pool.query(
-    `SELECT i.questions_per_play FROM institutions i JOIN institution_memberships m ON m.institution_id=i.id WHERE i.id=$1 AND i.is_active=true AND m.user_id=$2 AND m.status='active'`,
-    [institutionId.data, playerId],
-  );
-  if (!membership.rows[0]) return res.status(404).json({ success: false, message: "Active institution membership not found." });
-  const result = await pool.query(
-    `SELECT q.id,q.level_id,COALESCE(NULLIF(BTRIM(q.subject),''),'General') subject,q.question_text,q.media_url,q.media_type,q.read_aloud,q.shape_type,q.shape_color,q.time_limit_seconds,
-            COALESCE((SELECT json_agg(json_build_object('text',o.option_text,'mediaUrl',o.media_url,'mediaType',o.media_type,'shapeType',o.shape_type,'shapeColor',o.shape_color) ORDER BY o.option_order)
-                      FROM institution_question_options o WHERE o.question_id=q.id),'[]') options
-     FROM (SELECT q.* FROM institution_questions q JOIN institution_levels l ON l.id=q.level_id AND l.is_active=true JOIN institution_categories c ON c.id=l.category_id AND c.is_active=true WHERE q.institution_id=$1 AND q.level_id=$2 AND COALESCE(NULLIF(BTRIM(q.subject),''),'General')=$3 AND q.status='published' ORDER BY random() LIMIT $4) q
-     ORDER BY random()`,
-    [institutionId.data, parsed.data.levelId, parsed.data.subject, Number(membership.rows[0].questions_per_play) || 10],
-  );
-  return res.json({ success: true, questions: result.rows.map((row: Record<string, any>) => ({ id: row.id, levelId: row.level_id, subject: row.subject, text: row.question_text, mediaUrl: row.media_url, mediaType: row.media_type, readAloud: row.read_aloud, shapeType: row.shape_type, shapeColor: row.shape_color, timeLimitSeconds: row.time_limit_seconds, options: row.options })) });
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const membership = await client.query(
+      `SELECT i.questions_per_play FROM institutions i JOIN institution_memberships m ON m.institution_id=i.id
+       WHERE i.id=$1 AND i.is_active=true AND m.user_id=$2 AND m.status='active'`,
+      [institutionId.data, playerId],
+    );
+    if (!membership.rows[0]) { await client.query("ROLLBACK"); return res.status(404).json({ success: false, message: "Active institution membership not found." }); }
+    const result = await client.query(
+      `SELECT q.id,q.level_id,COALESCE(NULLIF(BTRIM(q.subject),''),'General') subject,q.question_text,q.media_url,q.media_type,q.read_aloud,q.shape_type,q.shape_color,q.time_limit_seconds,
+              COALESCE((SELECT json_agg(json_build_object('text',o.option_text,'mediaUrl',o.media_url,'mediaType',o.media_type,'shapeType',o.shape_type,'shapeColor',o.shape_color) ORDER BY o.option_order)
+                        FROM institution_question_options o WHERE o.question_id=q.id),'[]') options
+       FROM (SELECT q.* FROM institution_questions q JOIN institution_levels l ON l.id=q.level_id AND l.is_active=true JOIN institution_categories c ON c.id=l.category_id AND c.is_active=true WHERE q.institution_id=$1 AND q.level_id=$2 AND COALESCE(NULLIF(BTRIM(q.subject),''),'General')=$3 AND q.status='published' ORDER BY random() LIMIT $4) q
+       ORDER BY random()`,
+      [institutionId.data, parsed.data.levelId, parsed.data.subject, Number(membership.rows[0].questions_per_play) || 10],
+    );
+    if (!result.rowCount) { await client.query("ROLLBACK"); return res.status(409).json({ success: false, message: "No published questions are available in this learning area yet." }); }
+    const stateResult = await client.query(
+      `SELECT u.coins_count,u.lives_remaining,s.max_lives,s.passing_score_percent,s.refill_coin_cost
+       FROM users u CROSS JOIN gameplay_settings s WHERE u.id=$1 AND s.id=1 FOR UPDATE OF u`,
+      [playerId],
+    );
+    const state = stateResult.rows[0];
+    if (!state) { await client.query("ROLLBACK"); return res.status(404).json({ success: false, message: "Player gameplay settings could not be loaded." }); }
+    let livesRemaining = Number(state.lives_remaining), coinBalance = Number(state.coins_count), refilled = false;
+    const maxLives = Number(state.max_lives), refillCoinCost = Number(state.refill_coin_cost);
+    if (livesRemaining <= 0) {
+      if (coinBalance < refillCoinCost) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ success: false, code: "NO_LIVES", message: "You have no lives remaining and not enough coins to refill them. Please wait for lives to restore or get more coins.", livesRemaining: 0, coinBalance, maxLives, refillCoinCost });
+      }
+      const transaction = await recordCoinTransaction({ userId: playerId, type: "deduction", amount: refillCoinCost, description: `Automatic refill to ${maxLives} lives before institution practice`, reference: `life-refill:institution:${randomUUID()}`, metadata: { institutionId: institutionId.data, levelId: parsed.data.levelId, kind: "institution_practice_refill" } }, client);
+      coinBalance = Number(transaction.balance_after);
+      livesRemaining = maxLives;
+      refilled = true;
+      await client.query("UPDATE users SET lives_remaining=$1,updated_at=NOW() WHERE id=$2", [livesRemaining, playerId]);
+    }
+    const playId = randomUUID();
+    const questionIds = result.rows.map((row: Record<string, any>) => row.id);
+    await client.query(
+      `INSERT INTO institution_practice_plays(id,institution_id,user_id,level_id,subject,question_ids,expected_question_count)
+       VALUES($1,$2,$3,$4,$5,$6::uuid[],$7)`,
+      [playId, institutionId.data, playerId, parsed.data.levelId, parsed.data.subject, questionIds, questionIds.length],
+    );
+    await client.query("COMMIT");
+    return res.json({ success: true, play: { id: playId }, gameplay: { livesRemaining, maxLives, coinBalance, passingScorePercent: Number(state.passing_score_percent), refillCoinCost, refilled }, questions: result.rows.map((row: Record<string, any>) => ({ id: row.id, levelId: row.level_id, subject: row.subject, text: row.question_text, mediaUrl: row.media_url, mediaType: row.media_type, readAloud: row.read_aloud, shapeType: row.shape_type, shapeColor: row.shape_color, timeLimitSeconds: row.time_limit_seconds, options: row.options })) });
+  } catch (error) { await client.query("ROLLBACK"); throw error; }
+  finally { client.release(); }
 });
 router.post("/my-learning/:institutionId/practice/review", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
   const institutionId = z.string().uuid().safeParse(req.params.institutionId);
@@ -564,6 +600,64 @@ router.post("/my-learning/:institutionId/practice/review", verifyPlayerToken, as
   );
   return res.json({ success: true, reviews: result.rows.map((row: Record<string, any>) => ({ attemptId: row.attempt_id, questionId: row.question_id, selectedOptionOrder: row.selected_option_order === null ? null : Number(row.selected_option_order), correctOptionOrder: row.correct_option_order === null ? null : Number(row.correct_option_order), correct: row.is_correct, timedOut: Boolean(row.timed_out), explanation: row.explanation || "" })) });
 });
+router.post("/my-learning/:institutionId/practice/complete", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
+  const institutionId = z.string().uuid().safeParse(req.params.institutionId);
+  const parsed = z.object({ playId: z.string().uuid() }).safeParse(req.body || {});
+  if (!institutionId.success || !parsed.success) return res.status(400).json({ success: false, message: "This practice play could not be saved." });
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const stateResult = await client.query(
+      `SELECT p.*,u.coins_count,u.lives_remaining,s.max_lives,s.passing_score_percent,s.refill_coin_cost
+       FROM institution_practice_plays p JOIN users u ON u.id=p.user_id CROSS JOIN gameplay_settings s
+       WHERE p.id=$1 AND p.institution_id=$2 AND p.user_id=$3 AND s.id=1
+         AND EXISTS (SELECT 1 FROM institutions i WHERE i.id=$2 AND i.is_active=true)
+         AND EXISTS (SELECT 1 FROM institution_memberships m WHERE m.institution_id=$2 AND m.user_id=$3 AND m.status='active')
+       FOR UPDATE OF p,u`,
+      [parsed.data.playId, institutionId.data, req.user!.id],
+    );
+    const play = stateResult.rows[0];
+    if (!play) { await client.query("ROLLBACK"); return res.status(404).json({ success: false, message: "This practice play could not be found." }); }
+    if (play.completed_at) {
+      await client.query("COMMIT");
+      return res.json({ success: true, replayed: true, passed: Boolean(play.passed), scorePercent: Number(play.score_percent), correctAnswers: Number(play.correct_count), totalQuestions: Number(play.expected_question_count), lifeLost: Boolean(play.life_lost), livesRemaining: Number(play.lives_after), coinBalance: Number(play.coin_balance_after), maxLives: Number(play.max_lives), refillCoinCost: Number(play.refill_coin_cost), refilled: Boolean(play.refilled), needsPurchase: Boolean(play.life_lost) && Number(play.lives_after) === 0 });
+    }
+    const attemptResult = await client.query(
+      `SELECT COUNT(*)::int AS completed,COUNT(*) FILTER (WHERE is_correct IS TRUE)::int AS correct
+       FROM institution_question_attempts WHERE play_id=$1 AND institution_id=$2 AND user_id=$3 AND completed_at IS NOT NULL`,
+      [parsed.data.playId, institutionId.data, req.user!.id],
+    );
+    const completedCount = Number(attemptResult.rows[0]?.completed || 0);
+    const expectedCount = Number(play.expected_question_count);
+    if (completedCount !== expectedCount) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ success: false, code: "PRACTICE_INCOMPLETE", message: "Finish every question in this play before submitting your result." });
+    }
+    const correctCount = Number(attemptResult.rows[0]?.correct || 0);
+    const scorePercent = Math.round(correctCount * 100 / expectedCount);
+    const passed = scorePercent >= Number(play.passing_score_percent);
+    let livesRemaining = Number(play.lives_remaining), coinBalance = Number(play.coins_count), refilled = false;
+    if (!passed) {
+      livesRemaining = Math.max(0, livesRemaining - 1);
+      if (livesRemaining === 0 && coinBalance >= Number(play.refill_coin_cost)) {
+        const refill = await recordCoinTransaction({ userId: req.user!.id, type: "deduction", amount: Number(play.refill_coin_cost), description: `Automatic refill to ${play.max_lives} lives after a failed institution practice`, reference: `life-refill:institution:${parsed.data.playId}`, metadata: { institutionId: institutionId.data, levelId: play.level_id, playId: parsed.data.playId, kind: "institution_practice_refill" } }, client);
+        coinBalance = Number(refill.balance_after);
+        livesRemaining = Number(play.max_lives);
+        refilled = true;
+      }
+      await client.query("UPDATE users SET lives_remaining=$1,updated_at=NOW() WHERE id=$2", [livesRemaining, req.user!.id]);
+    }
+    await client.query(
+      `UPDATE institution_practice_plays SET completed_at=NOW(),correct_count=$2,score_percent=$3,passed=$4,life_lost=$5,lives_after=$6,coin_balance_after=$7,refilled=$8 WHERE id=$1`,
+      [parsed.data.playId, correctCount, scorePercent, passed, !passed, livesRemaining, coinBalance, refilled],
+    );
+    await client.query("UPDATE institution_question_attempts SET play_completed_at=NOW() WHERE play_id=$1 AND institution_id=$2 AND user_id=$3", [parsed.data.playId, institutionId.data, req.user!.id]);
+    await client.query("COMMIT");
+    return res.json({ success: true, passed, scorePercent, correctAnswers: correctCount, totalQuestions: expectedCount, passingScorePercent: Number(play.passing_score_percent), lifeLost: !passed, livesRemaining, maxLives: Number(play.max_lives), coinBalance, refillCoinCost: Number(play.refill_coin_cost), refilled, needsPurchase: !passed && livesRemaining === 0 });
+  } catch (error) { await client.query("ROLLBACK"); throw error; }
+  finally { client.release(); }
+});
+
 router.get("/my-learning/:institutionId/history", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
   const parsedId = z.string().uuid().safeParse(req.params.institutionId);
   if (!parsedId.success) return res.status(404).json({ success: false, message: "Institution not found." });
@@ -579,32 +673,48 @@ router.get("/my-learning/:institutionId/history", verifyPlayerToken, async (req:
   const page = Number.isSafeInteger(requestedPage) && requestedPage > 0 ? requestedPage : 1;
   const limit = Number.isSafeInteger(requestedLimit) && requestedLimit > 0 ? Math.min(50, requestedLimit) : 10;
   const offset = (page - 1) * limit;
-  const [count, attempts] = await Promise.all([
-    pool.query("SELECT COUNT(*)::int AS total FROM institution_question_attempts WHERE institution_id=$1 AND user_id=$2 AND completed_at IS NOT NULL", [parsedId.data, playerId]),
+  await purgeExpiredInstitutionLearningHistory();
+  const [count, plays] = await Promise.all([
+    pool.query("SELECT COUNT(DISTINCT COALESCE(play_id,id))::int AS total FROM institution_question_attempts WHERE institution_id=$1 AND user_id=$2 AND completed_at IS NOT NULL AND (play_id IS NULL OR play_completed_at IS NOT NULL)", [parsedId.data, playerId]),
     pool.query(
-      `SELECT a.id,a.started_at,a.completed_at,a.expires_at,a.selected_option_order,a.is_correct,a.timed_out,
-              q.question_text,q.subject,l.name AS level_name,o.option_text AS selected_option
-       FROM institution_question_attempts a
+      `WITH selected_plays AS (
+         SELECT COALESCE(a.play_id,a.id) AS play_id,MIN(a.started_at) AS started_at,MAX(COALESCE(a.play_completed_at,a.completed_at)) AS completed_at,
+                MAX(q.subject) AS subject,MAX(l.name) AS level_name,
+                COUNT(*)::int AS question_count,COUNT(*) FILTER (WHERE a.is_correct IS TRUE)::int AS correct_count
+         FROM institution_question_attempts a
+         JOIN institution_questions q ON q.id=a.question_id AND q.institution_id=a.institution_id
+         LEFT JOIN institution_levels l ON l.id=q.level_id
+         WHERE a.institution_id=$1 AND a.user_id=$2 AND a.completed_at IS NOT NULL
+           AND (a.play_id IS NULL OR a.play_completed_at IS NOT NULL)
+         GROUP BY COALESCE(a.play_id,a.id)
+         ORDER BY MAX(COALESCE(a.play_completed_at,a.completed_at)) DESC,COALESCE(a.play_id,a.id) DESC
+         LIMIT $3 OFFSET $4
+       )
+       SELECT p.play_id,p.started_at,p.completed_at,p.subject,p.level_name,p.question_count,p.correct_count,
+              json_agg(json_build_object(
+                'id',a.id,'question',q.question_text,'selectedOption',o.option_text,
+                'correct',a.is_correct,'timedOut',a.timed_out,'startedAt',a.started_at,'completedAt',a.completed_at
+              ) ORDER BY a.started_at,a.id) AS attempts
+       FROM selected_plays p
+       JOIN institution_question_attempts a ON COALESCE(a.play_id,a.id)=p.play_id AND a.institution_id=$1 AND a.user_id=$2 AND a.completed_at IS NOT NULL AND (a.play_id IS NULL OR a.play_completed_at IS NOT NULL)
        JOIN institution_questions q ON q.id=a.question_id AND q.institution_id=a.institution_id
-       LEFT JOIN institution_levels l ON l.id=q.level_id
        LEFT JOIN institution_question_options o ON o.question_id=q.id AND o.option_order=a.selected_option_order
-       WHERE a.institution_id=$1 AND a.user_id=$2 AND a.completed_at IS NOT NULL
-       ORDER BY a.completed_at DESC,a.id DESC LIMIT $3 OFFSET $4`,
+       GROUP BY p.play_id,p.started_at,p.completed_at,p.subject,p.level_name,p.question_count,p.correct_count
+       ORDER BY p.completed_at DESC,p.play_id DESC`,
       [parsedId.data, playerId, limit, offset],
     ),
   ]);
   return res.json({
     success: true,
-    attempts: attempts.rows.map((attempt: Record<string, any>) => ({
-      id: attempt.id,
-      question: attempt.question_text,
-      subject: attempt.subject,
-      level: attempt.level_name,
-      selectedOption: attempt.selected_option,
-      correct: attempt.is_correct,
-      timedOut: Boolean(attempt.timed_out),
-      startedAt: attempt.started_at,
-      completedAt: attempt.completed_at,
+    plays: plays.rows.map((play: Record<string, any>) => ({
+      id: play.play_id,
+      subject: play.subject,
+      level: play.level_name,
+      startedAt: play.started_at,
+      completedAt: play.completed_at,
+      questionCount: Number(play.question_count || 0),
+      correctCount: Number(play.correct_count || 0),
+      attempts: Array.isArray(play.attempts) ? play.attempts.map((attempt: Record<string, any>) => ({ ...attempt, timedOut: Boolean(attempt.timedOut) })) : [],
     })),
     pagination: { page, limit, total: Number(count.rows[0]?.total || 0) },
   });
@@ -613,17 +723,21 @@ router.get("/my-learning/:institutionId/history", verifyPlayerToken, async (req:
 router.post("/my-learning/:institutionId/questions/:questionId/start", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
   const institutionId = z.string().uuid().safeParse(req.params.institutionId);
   const questionId = z.string().uuid().safeParse(req.params.questionId);
-  const parsedKey = z.object({ attemptKey: z.string().uuid() }).safeParse(req.body || {});
+  const parsedKey = z.object({ attemptKey: z.string().uuid(), playId: z.string().uuid() }).safeParse(req.body || {});
   if (!institutionId.success || !questionId.success || !parsedKey.success) return res.status(400).json({ success: false, message: "This question session could not be started." });
   const playerId = req.user!.id;
+  const playerState = await pool.query("SELECT lives_remaining FROM users WHERE id=$1", [playerId]);
+  if (!playerState.rows[0]) return res.status(404).json({ success: false, message: "Player not found." });
+  if (Number(playerState.rows[0].lives_remaining) <= 0) return res.status(409).json({ success: false, code: "NO_LIVES", message: "You have no lives remaining. Restore your lives before continuing." });
   const attempt = await pool.query(
     `WITH inserted AS (
-       INSERT INTO institution_question_attempts(question_id,institution_id,user_id,attempt_key,started_at,expires_at)
-       SELECT q.id,q.institution_id,$4,$3,NOW(),NOW() + (q.time_limit_seconds * INTERVAL '1 second')
+       INSERT INTO institution_question_attempts(question_id,institution_id,user_id,attempt_key,started_at,expires_at,play_id)
+       SELECT q.id,q.institution_id,$4,$3,NOW(),NOW() + (q.time_limit_seconds * INTERVAL '1 second'),$5
        FROM institution_questions q
        WHERE q.id=$1 AND q.institution_id=$2 AND q.status='published'
          AND EXISTS (SELECT 1 FROM institutions i WHERE i.id=$2 AND i.is_active=true)
          AND EXISTS (SELECT 1 FROM institution_memberships m WHERE m.institution_id=$2 AND m.user_id=$4 AND m.status='active')
+         AND EXISTS (SELECT 1 FROM institution_practice_plays p WHERE p.id=$5 AND p.institution_id=$2 AND p.user_id=$4 AND p.completed_at IS NULL AND q.id=ANY(p.question_ids))
          AND NOT EXISTS (SELECT 1 FROM institution_question_attempts a WHERE a.question_id=q.id AND a.user_id=$4 AND a.completed_at IS NULL)
        ON CONFLICT(user_id,question_id,attempt_key) DO UPDATE SET attempt_key=EXCLUDED.attempt_key
        RETURNING id,started_at,expires_at
@@ -632,14 +746,81 @@ router.post("/my-learning/:institutionId/questions/:questionId/start", verifyPla
      UNION ALL
      SELECT a.id,a.started_at,a.expires_at FROM institution_question_attempts a
      JOIN institution_questions q ON q.id=a.question_id AND q.institution_id=a.institution_id AND q.status='published'
-     WHERE a.question_id=$1 AND a.institution_id=$2 AND a.user_id=$4 AND a.completed_at IS NULL
+     WHERE a.question_id=$1 AND a.institution_id=$2 AND a.user_id=$4 AND a.completed_at IS NULL AND a.play_id=$5
        AND EXISTS (SELECT 1 FROM institutions i WHERE i.id=$2 AND i.is_active=true)
        AND EXISTS (SELECT 1 FROM institution_memberships m WHERE m.institution_id=$2 AND m.user_id=$4 AND m.status='active')
      ORDER BY started_at DESC LIMIT 1`,
-    [questionId.data, institutionId.data, parsedKey.data.attemptKey, playerId],
+    [questionId.data, institutionId.data, parsedKey.data.attemptKey, playerId, parsedKey.data.playId],
   );
   if (!attempt.rows[0]) return res.status(404).json({ success: false, message: "Published question not found." });
   return res.json({ success: true, attempt: attempt.rows[0] });
+});
+
+router.post("/my-learning/:institutionId/questions/:questionId/action", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
+  const institutionId = z.string().uuid().safeParse(req.params.institutionId);
+  const questionId = z.string().uuid().safeParse(req.params.questionId);
+  const action = z.object({
+    actionId: z.string().uuid(), playId: z.string().uuid(), attemptId: z.string().uuid(),
+    eventKey: z.enum(["question_skipped", "wrong_option_removed", "answer_revealed"]),
+  }).safeParse(req.body || {});
+  if (!institutionId.success || !questionId.success || !action.success) return res.status(400).json({ success: false, message: "This lifeline could not be used." });
+  const playerId = req.user!.id;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const actionKey = `${playerId}:${action.data.playId}:${questionId.data}:${action.data.eventKey}`;
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [actionKey]);
+    const duplicate = await client.query(
+      `SELECT 1 FROM coin_transactions WHERE user_id=$1 AND metadata->>'institutionPlayId'=$2
+       AND metadata->>'questionId'=$3 AND metadata->>'eventKey'=$4 LIMIT 1`,
+      [playerId, action.data.playId, questionId.data, action.data.eventKey],
+    );
+    if (duplicate.rowCount) { await client.query("ROLLBACK"); return res.status(409).json({ success: false, message: "You have already used this lifeline for this question." }); }
+    const state = await client.query(
+      `SELECT u.coins_count,u.lives_remaining,a.id attempt_id,a.expires_at,a.completed_at
+       FROM users u JOIN institution_practice_plays p ON p.user_id=u.id
+       JOIN institution_question_attempts a ON a.play_id=p.id AND a.question_id=$3 AND a.id=$4 AND a.user_id=u.id
+       WHERE u.id=$1 AND p.id=$2 AND p.institution_id=$5 AND p.completed_at IS NULL AND a.completed_at IS NULL
+         AND a.expires_at>NOW() AND EXISTS (SELECT 1 FROM institutions i WHERE i.id=$5 AND i.is_active=true)
+         AND EXISTS (SELECT 1 FROM institution_memberships m WHERE m.institution_id=$5 AND m.user_id=$1 AND m.status='active')
+       FOR UPDATE OF u,p,a`,
+      [playerId, action.data.playId, questionId.data, action.data.attemptId, institutionId.data],
+    );
+    if (!state.rows[0]) { await client.query("ROLLBACK"); return res.status(409).json({ success: false, code: "QUESTION_ATTEMPT_INACTIVE", message: "Start an active question before using a lifeline." }); }
+    if (Number(state.rows[0].lives_remaining) <= 0) { await client.query("ROLLBACK"); return res.status(409).json({ success: false, code: "NO_LIVES", message: "You have no lives remaining. Restore your lives before using a lifeline." }); }
+    const ruleResult = await client.query("SELECT * FROM coin_rules WHERE event_key=$1 AND type='deduction' AND is_active=true", [action.data.eventKey]);
+    const rule = ruleResult.rows[0];
+    if (!rule) { await client.query("ROLLBACK"); return res.status(409).json({ success: false, code: "RULE_INACTIVE", message: "This lifeline is not currently available." }); }
+    const options = await client.query(
+      `SELECT o.option_order,o.is_correct FROM institution_questions q
+       JOIN institution_question_options o ON o.question_id=q.id
+       WHERE q.id=$1 AND q.institution_id=$2 AND q.status='published' ORDER BY o.option_order`,
+      [questionId.data, institutionId.data],
+    );
+    if (!options.rowCount) { await client.query("ROLLBACK"); return res.status(404).json({ success: false, message: "Question options could not be loaded." }); }
+    const transaction = await recordCoinTransaction({
+      userId: playerId, type: "deduction", amount: Number(rule.amount), description: rule.description || rule.name,
+      reference: `institution-game-action:${action.data.actionId}`, ruleId: rule.id,
+      metadata: { eventKey: action.data.eventKey, institutionId: institutionId.data, institutionPlayId: action.data.playId, questionId: questionId.data },
+    }, client);
+    let effect: Record<string, unknown> = {};
+    if (action.data.eventKey === "answer_revealed") effect = { correctOptionOrder: options.rows.find((option: { is_correct: boolean }) => option.is_correct)?.option_order };
+    if (action.data.eventKey === "wrong_option_removed") {
+      const incorrect = options.rows.filter((option: { is_correct: boolean }) => !option.is_correct);
+      if (!incorrect.length) { await client.query("ROLLBACK"); return res.status(409).json({ success: false, message: "There is no incorrect option to remove." }); }
+      effect = { removedOptionOrder: incorrect[Math.floor(Math.random() * incorrect.length)].option_order };
+    }
+    if (action.data.eventKey === "question_skipped") {
+      await client.query("UPDATE institution_question_attempts SET completed_at=NOW(),timed_out=false,is_correct=NULL,selected_option_order=NULL WHERE id=$1 AND completed_at IS NULL", [action.data.attemptId]);
+    }
+    await client.query("COMMIT");
+    return res.status(201).json({ success: true, eventKey: action.data.eventKey, amountDeducted: Number(rule.amount), coinBalance: Number(transaction.balance_after), ...effect });
+  } catch (error: any) {
+    await client.query("ROLLBACK");
+    if (error.code === "23505") return res.status(409).json({ success: false, message: "This lifeline was already used." });
+    if (error.status) return res.status(error.status).json({ success: false, message: error.message });
+    throw error;
+  } finally { client.release(); }
 });
 
 router.post("/my-learning/:institutionId/questions/:questionId/answer", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
@@ -651,6 +832,9 @@ router.post("/my-learning/:institutionId/questions/:questionId/answer", verifyPl
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+    const playerState = await client.query("SELECT lives_remaining FROM users WHERE id=$1 FOR UPDATE", [playerId]);
+    if (!playerState.rows[0]) { await client.query("ROLLBACK"); return res.status(404).json({ success: false, message: "Player not found." }); }
+    if (Number(playerState.rows[0].lives_remaining) <= 0) { await client.query("ROLLBACK"); return res.status(409).json({ success: false, code: "NO_LIVES", message: "You have no lives remaining. Restore your lives before answering." }); }
     const result = await client.query(
     `SELECT o.is_correct,q.explanation,a.expires_at,a.completed_at
      FROM institution_questions q JOIN institution_question_options o ON o.question_id=q.id AND o.option_order=$3

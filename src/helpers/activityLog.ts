@@ -115,3 +115,17 @@ export async function purgeExpiredInstitutionActivity(institutionId?: string): P
     return 0;
   }
 }
+
+/** Keep completed institution practice history for 30 days. Also clear abandoned attempts. */
+export async function purgeExpiredInstitutionLearningHistory(): Promise<number> {
+  try {
+    const plays = await pool.query("DELETE FROM institution_practice_plays WHERE started_at < NOW() - INTERVAL '30 days'");
+    const legacyAttempts = await pool.query("DELETE FROM institution_question_attempts WHERE play_id IS NULL AND started_at < NOW() - INTERVAL '30 days'");
+    const deleted = (plays.rowCount || 0) + (legacyAttempts.rowCount || 0);
+    if (deleted) console.log(JSON.stringify({ level: "info", event: "institution_learning_history_purged", deleted, retentionDays: 30 }));
+    return deleted;
+  } catch (error) {
+    console.error(JSON.stringify({ level: "error", event: "institution_learning_history_purge_failed", message: error instanceof Error ? error.message : "Unknown error" }));
+    return 0;
+  }
+}

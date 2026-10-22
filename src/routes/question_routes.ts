@@ -1,9 +1,11 @@
 import { Router } from "express";
+import { randomUUID } from "node:crypto";
 import multer from "multer";
 import { z } from "zod";
 import pool from "../config/database_connection";
 import { getAdminActor, logActivity, recordUploadEvent } from "../helpers/activityLog";
-import { verifyAdminToken, type AuthenticatedRequest } from "../middlewares/authentication_middleware";
+import { verifyAdminToken, verifyPlayerToken, type AuthenticatedRequest } from "../middlewares/authentication_middleware";
+import { recordCoinTransaction } from "../services/coin_service";
 import { generateQuestionDrafts } from "../services/ai_question_service";
 import { destroyMediaQuietly, StoredMedia, uploadMedia } from "../services/cloudinary_media_service";
 import { assertResourceUrls, destroyOnlyUnmanaged, registerImageResource } from "../helpers/resourceLibrary";
@@ -323,8 +325,28 @@ router.get("/admin/levels/:levelId/questions", verifyAdminToken, async (req, res
   return res.json({ success: true, level: level.rows[0], questions: result.rows.map((row: Record<string, unknown>) => ({ id: row.id, text: row.question_text, explanation: row.explanation, mediaUrl: row.media_url, mediaType: row.media_type, shapeType: row.shape_type, shapeColor: row.shape_color, status: row.status, createdAt: row.created_at, points: row.points_per_question, timeLimit: row.time_limit_seconds, options: row.options })) });
 });
 
-router.get("/catalog/levels/:levelId/questions", async (req, res) => {
+router.get("/catalog/levels/:levelId/questions", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
   const result = await pool.query(`WITH settings AS (SELECT id,points_per_question,time_limit_seconds,questions_per_play FROM game_levels WHERE id=$1 UNION ALL SELECT id,points_per_question,time_limit_seconds,questions_per_play FROM learning_items WHERE id=$1 AND item_type='level' LIMIT 1), selected AS (SELECT q.* FROM questions q,settings s WHERE (q.level_id=s.id OR q.learning_level_id=s.id) AND q.status='published' ORDER BY random() LIMIT (SELECT questions_per_play FROM settings)) SELECT q.id,q.question_text,q.explanation,q.media_url,q.media_type,q.read_aloud,q.shape_type,q.shape_color,s.points_per_question,s.time_limit_seconds,COALESCE(json_agg(json_build_object('id',o.id,'text',o.option_text,'mediaUrl',o.media_url,'mediaType',o.media_type,'isCorrect',o.is_correct,'shapeType',o.shape_type,'shapeColor',o.shape_color) ORDER BY o.option_order) FILTER (WHERE o.id IS NOT NULL),'[]') options FROM selected q CROSS JOIN settings s LEFT JOIN question_options o ON o.question_id=q.id GROUP BY q.id,q.question_text,q.explanation,q.media_url,q.media_type,q.read_aloud,q.shape_type,q.shape_color,s.points_per_question,s.time_limit_seconds ORDER BY random()`, [req.params.levelId]);
+  if (!result.rowCount) return res.json({ success: true, questions: [] });
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const stateResult = await client.query("SELECT u.coins_count,u.lives_remaining,s.max_lives,s.refill_coin_cost FROM users u CROSS JOIN gameplay_settings s WHERE u.id=$1 AND s.id=1 FOR UPDATE OF u", [req.user!.id]);
+    const state = stateResult.rows[0];
+    if (!state) { await client.query("ROLLBACK"); return res.status(404).json({ success: false, message: "Player gameplay settings could not be loaded." }); }
+    if (Number(state.lives_remaining) <= 0) {
+      if (Number(state.coins_count) < Number(state.refill_coin_cost)) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ success: false, code: "NO_LIVES", message: "You have no lives remaining and not enough coins to refill them. Please wait for lives to restore or get more coins.", livesRemaining: 0, coinBalance: Number(state.coins_count), maxLives: Number(state.max_lives), refillCoinCost: Number(state.refill_coin_cost) });
+      }
+      const refill = await recordCoinTransaction({ userId: req.user!.id, type: "deduction", amount: Number(state.refill_coin_cost), description: `Automatic refill to ${state.max_lives} lives before starting a game`, reference: `life-refill:game-start:${randomUUID()}`, metadata: { levelId: req.params.levelId, kind: "game_start_refill" } }, client);
+      await client.query("UPDATE users SET lives_remaining=$1,updated_at=NOW() WHERE id=$2", [state.max_lives, req.user!.id]);
+      await client.query("COMMIT");
+      return res.json({ success: true, gameplay: { livesRemaining: Number(state.max_lives), maxLives: Number(state.max_lives), coinBalance: Number(refill.balance_after), refilled: true }, questions: result.rows.map((row: Record<string, any>) => ({ id: row.id, text: row.question_text, explanation: row.explanation, mediaUrl: row.media_url, mediaType: row.media_type, readAloud: row.read_aloud, shapeType: row.shape_type, shapeColor: row.shape_color, points: row.points_per_question, timeLimit: row.time_limit_seconds, options: row.options.map(({ isCorrect: _hidden, ...option }: Record<string, unknown>) => option) })) });
+    }
+    await client.query("COMMIT");
+  } catch (error) { await client.query("ROLLBACK"); throw error; }
+  finally { client.release(); }
   res.json({ success: true, questions: result.rows.map((row: Record<string, any>) => ({ id: row.id, text: row.question_text, explanation: row.explanation, mediaUrl: row.media_url, mediaType: row.media_type, readAloud: row.read_aloud, shapeType: row.shape_type, shapeColor: row.shape_color, points: row.points_per_question, timeLimit: row.time_limit_seconds, options: row.options.map(({ isCorrect: _hidden, ...option }: Record<string, unknown>) => option) })) });
 });
 
