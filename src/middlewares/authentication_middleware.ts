@@ -51,3 +51,11 @@ export const verifyAdminToken = async (req: AuthenticatedRequest, res: Response,
     res.status(401).json({ success: false, code: "SESSION_INVALID", message: "Invalid, expired, or revoked admin session token." });
   }
 };
+
+export const requireSuperAdmin = (req: AuthenticatedRequest, res: Response, next: NextFunction): void => {
+  if (req.user?.role !== 'super_admin' || req.user.id !== 'super-admin') {
+    res.status(403).json({ success: false, code: 'SUPER_ADMIN_REQUIRED', message: 'Only the Super Admin can delete catalog content.' });
+    return;
+  }
+  next();
+};

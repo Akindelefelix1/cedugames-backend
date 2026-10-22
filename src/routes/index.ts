@@ -16,9 +16,16 @@ import dailyCheckinRoutes from "./daily_checkin_routes";
 import mediaRoutes from "./media_routes";
 import resourceRoutes from "./resource_routes";
 import familyPageRoutes from "./family_page_routes";
+import { verifyAdminToken, requireSuperAdmin, type AuthenticatedRequest } from "../middlewares/authentication_middleware";
 import {Router} from 'express';
 
 const router = Router();
+
+// Protect every administrative delete route centrally as well as in the catalog router.
+router.use((req, res, next) => {
+  if (req.method !== "DELETE" || !req.path.startsWith("/admin/")) return next();
+  verifyAdminToken(req as AuthenticatedRequest, res, () => requireSuperAdmin(req as AuthenticatedRequest, res, next));
+});
 
 router.use("/auth", aunthentication_routes);
 router.use("/auth/institution", institutionAuthRoutes);

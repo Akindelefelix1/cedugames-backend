@@ -50,3 +50,68 @@ export async function logActivity(activity: ActivityInput): Promise<void> {
     console.error(JSON.stringify({ level: "error", event: "activity_log_failed", activityType: activity.eventType, message: error instanceof Error ? error.message : "Unknown error" }));
   }
 }
+
+
+/** Remove upload audit records outside the 30-day retention window. */
+export async function purgeExpiredUploadEvents(): Promise<number> {
+  try {
+    const result = await pool.query("DELETE FROM admin_upload_events WHERE created_at < NOW() - INTERVAL '30 days'");
+    const deleted = result.rowCount || 0;
+    if (deleted) console.log(JSON.stringify({ level: "info", event: "admin_upload_events_purged", deleted }));
+    return deleted;
+  } catch (error) {
+    console.error(JSON.stringify({ level: "error", event: "admin_upload_events_purge_failed", message: error instanceof Error ? error.message : "Unknown error" }));
+    return 0;
+  }
+}
+
+
+export const activityRetentionOptions = [10, 15, 30, 60, 90, 180, 365] as const;
+export const defaultActivityRetentionDays = 15;
+
+export async function getActivityRetentionDays(): Promise<number> {
+  try {
+    const result = await pool.query("SELECT retention_days FROM admin_activity_retention_settings WHERE id=1");
+    const days = Number(result.rows[0]?.retention_days || defaultActivityRetentionDays);
+    return activityRetentionOptions.includes(days as typeof activityRetentionOptions[number]) ? days : defaultActivityRetentionDays;
+  } catch (error) {
+    console.error(JSON.stringify({ level: "error", event: "activity_retention_read_failed", message: error instanceof Error ? error.message : "Unknown error" }));
+    return defaultActivityRetentionDays;
+  }
+}
+
+export async function purgeExpiredActivityAndNotifications(retentionDays = defaultActivityRetentionDays): Promise<{ activities: number; notifications: number }> {
+  const safeDays = activityRetentionOptions.includes(retentionDays as typeof activityRetentionOptions[number]) ? retentionDays : defaultActivityRetentionDays;
+  try {
+    const [activities, notifications] = await Promise.all([
+      pool.query("DELETE FROM activity_logs WHERE metadata->>'institutionId' IS NULL AND created_at < NOW() - ($1 * INTERVAL '1 day')", [safeDays]),
+      pool.query("DELETE FROM notifications WHERE published_at < NOW() - ($1 * INTERVAL '1 day')", [safeDays]),
+    ]);
+    const deleted = { activities: activities.rowCount || 0, notifications: notifications.rowCount || 0 };
+    if (deleted.activities || deleted.notifications) console.log(JSON.stringify({ level: "info", event: "activity_retention_purged", retentionDays: safeDays, ...deleted }));
+    return deleted;
+  } catch (error) {
+    console.error(JSON.stringify({ level: "error", event: "activity_retention_purge_failed", retentionDays: safeDays, message: error instanceof Error ? error.message : "Unknown error" }));
+    return { activities: 0, notifications: 0 };
+  }
+}
+
+/** Remove institution activity according to each institution's own retention policy. */
+export async function purgeExpiredInstitutionActivity(institutionId?: string): Promise<number> {
+  try {
+    const result = await pool.query(
+      `DELETE FROM activity_logs a
+       USING institutions i
+       WHERE a.metadata->>'institutionId'=i.id::text
+         AND a.created_at < NOW() - (i.activity_retention_days * INTERVAL '1 day')
+         AND ($1::uuid IS NULL OR i.id=$1::uuid)`,
+      [institutionId || null],
+    );
+    const deleted = result.rowCount || 0;
+    if (deleted) console.log(JSON.stringify({ level: "info", event: "institution_activity_purged", deleted, institutionId: institutionId || null }));
+    return deleted;
+  } catch (error) {
+    console.error(JSON.stringify({ level: "error", event: "institution_activity_purge_failed", institutionId: institutionId || null, message: error instanceof Error ? error.message : "Unknown error" }));
+    return 0;
+  }
+}

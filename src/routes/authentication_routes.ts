@@ -9,7 +9,7 @@ import { env } from "../config/env";
 import { comparePassword, hashPassword } from "../helpers/hashPassword";
 import { SendOtp } from "../helpers/Mailer";
 import { generateOtp, hashOtp } from "../helpers/otp";
-import { logActivity } from "../helpers/activityLog";
+import { getActivityRetentionDays, logActivity } from "../helpers/activityLog";
 import { verifyAdminToken, verifyPlayerToken, type AuthenticatedRequest } from "../middlewares/authentication_middleware";
 import {
   AdminLoginSchema, ForgotPasswordSchema, GoogleAuthSchema, UserLoginSchema, RegisterUserSchema,
@@ -225,16 +225,17 @@ router.get("/admin/activities", verifyAdminToken, async (req, res) => {
   const limit = Number.isFinite(parsedLimit) ? Math.min(Math.max(parsedLimit, 1), 100) : 20;
   const page = Number.isFinite(parsedPage) ? Math.max(parsedPage, 1) : 1;
   try {
+    const retentionDays = await getActivityRetentionDays();
     const [activities, total] = await Promise.all([
       pool.query(
         `SELECT id,event_type,title,description,actor_id,actor_name,metadata,created_at
-         FROM activity_logs ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
-        [limit, (page - 1) * limit],
+         FROM activity_logs WHERE created_at >= NOW() - ($1 * INTERVAL '1 day') ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
+        [retentionDays, limit, (page - 1) * limit],
       ),
-      pool.query("SELECT COUNT(*)::int AS count FROM activity_logs"),
+      pool.query("SELECT COUNT(*)::int AS count FROM activity_logs WHERE created_at >= NOW() - ($1 * INTERVAL '1 day')", [retentionDays]),
     ]);
     const count = total.rows[0]?.count || 0;
-    return res.json({ success: true, activities: activities.rows, pagination: { page, limit, total: count, totalPages: Math.ceil(count / limit) } });
+    return res.json({ success: true, activities: activities.rows, retentionDays, pagination: { page, limit, total: count, totalPages: Math.ceil(count / limit) } });
   } catch (error) {
     console.error("Admin activity listing failed", error);
     return res.status(500).json({ success: false, message: "Activities could not be loaded." });
@@ -251,13 +252,17 @@ router.get("/admin/upload-analytics", verifyAdminToken, async (req, res) => {
     return res.status(400).json({ success: false, message: "Choose a valid date range of up to 366 days." });
   }
   const bucket = granularity === "day" ? "day" : granularity === "week" ? "week" : "month";
+  const page = Math.max(1, Math.floor(Number(req.query.page) || 1));
+  const limit = 15;
+  const offset = (page - 1) * limit;
   const values = [from.toISOString(), to.toISOString()];
   try {
-    const [summary, trend, ranking, recent, admins] = await Promise.all([
+    const [summary, trend, ranking, recent, recentCount, admins] = await Promise.all([
       pool.query(`SELECT COALESCE(SUM(question_count),0)::int total_questions,COALESCE(SUM(image_count),0)::int total_images,COUNT(DISTINCT COALESCE(actor_id::text,actor_name))::int active_admins,COUNT(*)::int upload_events FROM admin_upload_events WHERE created_at >= $1 AND created_at < $2`, values),
       pool.query(`SELECT date_trunc('${bucket}',created_at) bucket,COALESCE(SUM(question_count),0)::int questions,COALESCE(SUM(image_count),0)::int images FROM admin_upload_events WHERE created_at >= $1 AND created_at < $2 GROUP BY 1 ORDER BY 1`, values),
       pool.query(`SELECT COALESCE(actor_id::text,'super-admin') admin_id,MAX(actor_name) admin_name,COALESCE(SUM(question_count),0)::int questions,COALESCE(SUM(image_count),0)::int images,COUNT(*)::int upload_events,MAX(created_at) last_upload FROM admin_upload_events WHERE created_at >= $1 AND created_at < $2 GROUP BY 1 ORDER BY questions DESC,images DESC,admin_name`, values),
-      pool.query(`SELECT id,actor_id,actor_name,upload_type,question_count,image_count,metadata,created_at FROM admin_upload_events WHERE created_at >= $1 AND created_at < $2 ORDER BY created_at DESC LIMIT 50`, values),
+      pool.query(`SELECT id,actor_id,actor_name,upload_type,question_count,image_count,metadata,created_at FROM admin_upload_events WHERE created_at >= $1 AND created_at < $2 ORDER BY created_at DESC LIMIT $3 OFFSET $4`, [...values, limit, offset]),
+      pool.query(`SELECT COUNT(*)::int total FROM admin_upload_events WHERE created_at >= $1 AND created_at < $2`, values),
       pool.query(`SELECT id,name,email,admin_title title,is_active FROM users WHERE role='admin' ORDER BY name`),
     ]);
     const byId = new Map<string, any>(ranking.rows.map((row: Record<string, any>) => [row.admin_id, row] as [string, any]));
@@ -268,7 +273,7 @@ router.get("/admin/upload-analytics", verifyAdminToken, async (req, res) => {
       const row = byId.get(admin.id);
       return { ...admin, questions: row?.questions || 0, images: row?.images || 0, uploadEvents: row?.upload_events || 0, lastUpload: row?.last_upload || null };
     }).sort((a, b) => b.questions - a.questions || b.images - a.images || a.name.localeCompare(b.name));
-    return res.json({ success: true, range: { from: from.toISOString(), to: to.toISOString(), granularity }, summary: summary.rows[0], trend: trend.rows.map((row: Record<string, any>) => ({ bucket: row.bucket, questions: row.questions, images: row.images })), leaderboard, recentUploads: recent.rows });
+    return res.json({ success: true, range: { from: from.toISOString(), to: to.toISOString(), granularity }, summary: summary.rows[0], trend: trend.rows.map((row: Record<string, any>) => ({ bucket: row.bucket, questions: row.questions, images: row.images })), leaderboard, recentUploads: recent.rows, auditPagination: { page, limit, total: recentCount.rows[0]?.total || 0, totalPages: Math.ceil((recentCount.rows[0]?.total || 0) / limit) } });
   } catch (error: any) {
     if (error?.code === "42P01") return res.status(503).json({ success: false, message: "Upload tracking is not ready. Run npm run migrate on the backend, then redeploy." });
     console.error("Admin upload analytics failed", error);
@@ -470,6 +475,7 @@ router.patch("/user/profiles/:id", verifyPlayerToken, async (req: AuthenticatedR
 });
 
 router.get("/user/dashboard-bootstrap", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
+  const retentionDays = await getActivityRetentionDays();
   const [player, preferences, notifications] = await Promise.all([
     pool.query(
       `SELECT u.id,u.name,u.username,COALESCE(parent.email,u.email) email,u.profile_image_url,u.coins_count,u.lives_remaining,u.parent_user_id,
@@ -484,11 +490,11 @@ router.get("/user/dashboard-bootstrap", verifyPlayerToken, async (req: Authentic
        FROM notifications n
        CROSS JOIN users u
        LEFT JOIN notification_reads nr ON nr.notification_id=n.id AND nr.user_id=u.id
-       WHERE u.id=$1 AND n.published_at<=NOW()
+       WHERE u.id=$1 AND n.published_at<=NOW() AND n.published_at >= NOW() - ($2 * INTERVAL '1 day')
          AND (n.audience='all' OR (n.audience='verified' AND u.is_verified=true)
            OR (n.audience='unverified' AND u.is_verified=false))
          AND nr.user_id IS NULL`,
-      [req.user!.id],
+      [req.user!.id, retentionDays],
     ),
   ]);
   if (!player.rows[0]) return res.status(404).json({ success: false, message: "Player not found." });
