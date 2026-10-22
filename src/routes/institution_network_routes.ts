@@ -675,31 +675,41 @@ router.get("/my-learning/:institutionId/history", verifyPlayerToken, async (req:
   const offset = (page - 1) * limit;
   await purgeExpiredInstitutionLearningHistory();
   const [count, plays] = await Promise.all([
-    pool.query("SELECT COUNT(DISTINCT COALESCE(play_id,id))::int AS total FROM institution_question_attempts WHERE institution_id=$1 AND user_id=$2 AND completed_at IS NOT NULL AND (play_id IS NULL OR play_completed_at IS NOT NULL)", [parsedId.data, playerId]),
     pool.query(
-      `WITH selected_plays AS (
-         SELECT COALESCE(a.play_id,a.id) AS play_id,MIN(a.started_at) AS started_at,MAX(COALESCE(a.play_completed_at,a.completed_at)) AS completed_at,
-                MAX(q.subject) AS subject,MAX(l.name) AS level_name,
-                COUNT(*)::int AS question_count,COUNT(*) FILTER (WHERE a.is_correct IS TRUE)::int AS correct_count
+      `SELECT (SELECT COUNT(*) FROM institution_practice_plays WHERE institution_id=$1 AND user_id=$2 AND completed_at IS NOT NULL)
+            + (SELECT COUNT(*) FROM institution_question_attempts WHERE institution_id=$1 AND user_id=$2 AND play_id IS NULL AND completed_at IS NOT NULL) AS total`,
+      [parsedId.data, playerId],
+    ),
+    pool.query(
+      `WITH all_plays AS (
+         SELECT p.id AS play_id,p.started_at,p.completed_at,p.subject,l.name AS level_name,
+                p.expected_question_count AS question_count,p.correct_count,p.question_ids,false AS legacy
+         FROM institution_practice_plays p LEFT JOIN institution_levels l ON l.id=p.level_id
+         WHERE p.institution_id=$1 AND p.user_id=$2 AND p.completed_at IS NOT NULL
+         UNION ALL
+         SELECT a.id,a.started_at,a.completed_at,COALESCE(NULLIF(BTRIM(q.subject),''),'General'),l.name,
+                1,CASE WHEN a.is_correct IS TRUE THEN 1 ELSE 0 END,ARRAY[q.id]::uuid[],true
          FROM institution_question_attempts a
          JOIN institution_questions q ON q.id=a.question_id AND q.institution_id=a.institution_id
          LEFT JOIN institution_levels l ON l.id=q.level_id
-         WHERE a.institution_id=$1 AND a.user_id=$2 AND a.completed_at IS NOT NULL
-           AND (a.play_id IS NULL OR a.play_completed_at IS NOT NULL)
-         GROUP BY COALESCE(a.play_id,a.id)
-         ORDER BY MAX(COALESCE(a.play_completed_at,a.completed_at)) DESC,COALESCE(a.play_id,a.id) DESC
-         LIMIT $3 OFFSET $4
+         WHERE a.institution_id=$1 AND a.user_id=$2 AND a.play_id IS NULL AND a.completed_at IS NOT NULL
+       ), selected_plays AS (
+         SELECT * FROM all_plays ORDER BY completed_at DESC,play_id DESC LIMIT $3 OFFSET $4
        )
        SELECT p.play_id,p.started_at,p.completed_at,p.subject,p.level_name,p.question_count,p.correct_count,
-              json_agg(json_build_object(
-                'id',a.id,'question',q.question_text,'selectedOption',o.option_text,
-                'correct',a.is_correct,'timedOut',a.timed_out,'startedAt',a.started_at,'completedAt',a.completed_at
-              ) ORDER BY a.started_at,a.id) AS attempts
+              COALESCE(details.attempts,'[]'::json) AS attempts
        FROM selected_plays p
-       JOIN institution_question_attempts a ON COALESCE(a.play_id,a.id)=p.play_id AND a.institution_id=$1 AND a.user_id=$2 AND a.completed_at IS NOT NULL AND (a.play_id IS NULL OR a.play_completed_at IS NOT NULL)
-       JOIN institution_questions q ON q.id=a.question_id AND q.institution_id=a.institution_id
-       LEFT JOIN institution_question_options o ON o.question_id=q.id AND o.option_order=a.selected_option_order
-       GROUP BY p.play_id,p.started_at,p.completed_at,p.subject,p.level_name,p.question_count,p.correct_count
+       LEFT JOIN LATERAL (
+         SELECT json_agg(json_build_object(
+           'id',a.id,'question',q.question_text,'selectedOption',o.option_text,
+           'correct',a.is_correct,'timedOut',a.timed_out,'startedAt',a.started_at,'completedAt',a.completed_at
+         ) ORDER BY a.started_at,a.id) AS attempts
+         FROM institution_question_attempts a
+         JOIN institution_questions q ON q.id=a.question_id AND q.institution_id=a.institution_id
+         LEFT JOIN institution_question_options o ON o.question_id=a.question_id AND o.option_order=a.selected_option_order
+         WHERE a.institution_id=$1 AND a.user_id=$2 AND a.completed_at IS NOT NULL
+           AND ((p.legacy AND a.id=p.play_id AND a.play_id IS NULL) OR (NOT p.legacy AND a.play_id=p.play_id AND a.play_completed_at IS NOT NULL))
+       ) details ON true
        ORDER BY p.completed_at DESC,p.play_id DESC`,
       [parsedId.data, playerId, limit, offset],
     ),
