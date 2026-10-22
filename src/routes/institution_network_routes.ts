@@ -478,6 +478,52 @@ router.get("/my-learning/:institutionId", verifyPlayerToken, async (req: Authent
   });
 });
 
+router.get("/my-learning/:institutionId/history", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
+  const parsedId = z.string().uuid().safeParse(req.params.institutionId);
+  if (!parsedId.success) return res.status(404).json({ success: false, message: "Institution not found." });
+  const accountId = req.user!.accountId || req.user!.id;
+  const membership = await pool.query(
+    `SELECT 1 FROM institution_memberships m JOIN institutions i ON i.id=m.institution_id
+     WHERE m.user_id=$1 AND m.institution_id=$2 AND m.status='active' AND i.is_active=true`,
+    [accountId, parsedId.data],
+  );
+  if (!membership.rows[0]) return res.status(404).json({ success: false, message: "Active institution membership not found." });
+  const requestedPage = Number(req.query.page);
+  const requestedLimit = Number(req.query.limit);
+  const page = Number.isSafeInteger(requestedPage) && requestedPage > 0 ? requestedPage : 1;
+  const limit = Number.isSafeInteger(requestedLimit) && requestedLimit > 0 ? Math.min(50, requestedLimit) : 10;
+  const offset = (page - 1) * limit;
+  const [count, attempts] = await Promise.all([
+    pool.query("SELECT COUNT(*)::int AS total FROM institution_question_attempts WHERE institution_id=$1 AND user_id=$2 AND completed_at IS NOT NULL", [parsedId.data, accountId]),
+    pool.query(
+      `SELECT a.id,a.started_at,a.completed_at,a.expires_at,a.selected_option_order,a.is_correct,a.timed_out,
+              q.question_text,q.subject,l.name AS level_name,o.option_text AS selected_option
+       FROM institution_question_attempts a
+       JOIN institution_questions q ON q.id=a.question_id AND q.institution_id=a.institution_id
+       LEFT JOIN institution_levels l ON l.id=q.level_id
+       LEFT JOIN institution_question_options o ON o.question_id=q.id AND o.option_order=a.selected_option_order
+       WHERE a.institution_id=$1 AND a.user_id=$2 AND a.completed_at IS NOT NULL
+       ORDER BY a.completed_at DESC,a.id DESC LIMIT $3 OFFSET $4`,
+      [parsedId.data, accountId, limit, offset],
+    ),
+  ]);
+  return res.json({
+    success: true,
+    attempts: attempts.rows.map((attempt: Record<string, any>) => ({
+      id: attempt.id,
+      question: attempt.question_text,
+      subject: attempt.subject,
+      level: attempt.level_name,
+      selectedOption: attempt.selected_option,
+      correct: attempt.is_correct,
+      timedOut: Boolean(attempt.timed_out),
+      startedAt: attempt.started_at,
+      completedAt: attempt.completed_at,
+    })),
+    pagination: { page, limit, total: Number(count.rows[0]?.total || 0) },
+  });
+});
+
 router.post("/my-learning/:institutionId/questions/:questionId/start", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
   const institutionId = z.string().uuid().safeParse(req.params.institutionId);
   const questionId = z.string().uuid().safeParse(req.params.questionId);
@@ -514,23 +560,58 @@ router.post("/my-learning/:institutionId/questions/:questionId/answer", verifyPl
   const answer = z.object({ optionIndex: z.coerce.number().int().min(0).max(3), attemptId: z.string().uuid() }).safeParse(req.body || {});
   if (!institutionId.success || !questionId.success || !answer.success) return res.status(400).json({ success: false, message: "Start this question before submitting an answer." });
   const accountId = req.user!.accountId || req.user!.id;
-  const result = await pool.query(
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const result = await client.query(
     `SELECT o.is_correct,q.explanation,a.expires_at,a.completed_at
      FROM institution_questions q JOIN institution_question_options o ON o.question_id=q.id AND o.option_order=$3
      JOIN institution_question_attempts a ON a.question_id=q.id AND a.institution_id=q.institution_id AND a.id=$5 AND a.user_id=$4
      WHERE q.id=$1 AND q.institution_id=$2 AND q.status='published'
-       AND EXISTS (SELECT 1 FROM institution_memberships m WHERE m.institution_id=$2 AND m.user_id=$4 AND m.status='active')`,
+       AND EXISTS (SELECT 1 FROM institution_memberships m WHERE m.institution_id=$2 AND m.user_id=$4 AND m.status='active')
+     FOR UPDATE OF a`,
     [questionId.data, institutionId.data, answer.data.optionIndex, accountId, answer.data.attemptId],
   );
-  if (!result.rows[0]) return res.status(404).json({ success: false, message: "Published question not found." });
-  if (result.rows[0].completed_at) return res.status(409).json({ success: false, code: "QUESTION_ATTEMPT_COMPLETE", message: "This question attempt is already complete." });
+  if (!result.rows[0]) { await client.query("ROLLBACK"); return res.status(404).json({ success: false, message: "Published question not found." }); }
+  if (result.rows[0].completed_at) { await client.query("ROLLBACK"); return res.status(409).json({ success: false, code: "QUESTION_ATTEMPT_COMPLETE", message: "This question attempt is already complete." }); }
   if (Date.now() >= new Date(result.rows[0].expires_at).getTime()) {
-    await pool.query("UPDATE institution_question_attempts SET completed_at=COALESCE(completed_at,NOW()) WHERE id=$1", [answer.data.attemptId]);
+    await client.query("UPDATE institution_question_attempts SET completed_at=NOW(),timed_out=true,is_correct=NULL,selected_option_order=NULL WHERE id=$1", [answer.data.attemptId]);
+    await client.query("COMMIT");
     return res.status(408).json({ success: false, code: "QUESTION_TIME_EXPIRED", message: "This question's time limit has ended." });
   }
   const correct = Boolean(result.rows[0].is_correct);
-  if (correct) await pool.query("UPDATE institution_question_attempts SET completed_at=NOW() WHERE id=$1 AND completed_at IS NULL", [answer.data.attemptId]);
+  await client.query(
+    "UPDATE institution_question_attempts SET selected_option_order=$2,is_correct=$3,timed_out=false,completed_at=CASE WHEN $3 THEN NOW() ELSE NULL END WHERE id=$1 AND completed_at IS NULL",
+    [answer.data.attemptId, answer.data.optionIndex, correct],
+  );
+  await client.query("COMMIT");
   return res.json({ success: true, correct, explanation: correct ? result.rows[0].explanation : null });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally { client.release(); }
+});
+
+router.post("/my-learning/:institutionId/questions/:questionId/finish", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
+  const institutionId = z.string().uuid().safeParse(req.params.institutionId);
+  const questionId = z.string().uuid().safeParse(req.params.questionId);
+  const attempt = z.object({ attemptId: z.string().uuid(), timedOut: z.boolean().optional().default(false) }).safeParse(req.body || {});
+  if (!institutionId.success || !questionId.success || !attempt.success) return res.status(400).json({ success: false, message: "This question session could not be completed." });
+  const accountId = req.user!.accountId || req.user!.id;
+  const finished = await pool.query(
+    `UPDATE institution_question_attempts a SET completed_at=COALESCE(a.completed_at,NOW()),
+       timed_out=CASE WHEN $5 THEN true ELSE a.timed_out END,
+       is_correct=CASE WHEN $5 THEN NULL ELSE a.is_correct END,
+       selected_option_order=CASE WHEN $5 THEN NULL ELSE a.selected_option_order END
+     FROM institution_questions q
+     WHERE a.id=$1 AND a.question_id=$2 AND a.institution_id=$3 AND a.user_id=$4
+       AND q.id=a.question_id AND q.institution_id=a.institution_id
+       AND EXISTS (SELECT 1 FROM institution_memberships m WHERE m.institution_id=$3 AND m.user_id=$4 AND m.status='active')
+     RETURNING a.id`,
+    [attempt.data.attemptId, questionId.data, institutionId.data, accountId, attempt.data.timedOut],
+  );
+  if (!finished.rows[0]) return res.status(404).json({ success: false, message: "Question attempt not found." });
+  return res.json({ success: true });
 });
 
 router.get("/my-learning", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
