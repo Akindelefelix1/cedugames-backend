@@ -17,6 +17,8 @@ const JoinSchema = z.object({ inviteCode: z.string().trim().max(20).optional().o
 const InvitationSchema = z.object({ target: z.string().trim().min(7).max(320) });
 const StatusSchema = z.object({ status: z.enum(["active", "rejected"]) });
 const InstitutionActivityRetentionSchema = z.object({ retentionDays: z.union([z.literal(15), z.literal(30)]) });
+const InstitutionPracticeSettingsSchema = z.object({ questionsPerPlay: z.coerce.number().int().min(1).max(200) });
+const InstitutionPracticeStartSchema = z.object({ levelId: z.string().uuid(), subject: z.string().trim().min(1).max(120) });
 const StructureSettingsSchema = z.object({ categoryLabel: z.string().trim().min(2).max(80), levelLabel: z.string().trim().min(2).max(80), learnerLabel: z.string().trim().min(2).max(80), subjectLabel: z.string().trim().min(2).max(80) });
 const CategorySchema = z.object({ name: z.string().trim().min(2).max(120), description: z.string().trim().max(500).default(""), sortOrder: z.coerce.number().int().min(0).max(10000).default(0) });
 const LevelSchema = z.object({ categoryId: z.string().uuid(), name: z.string().trim().min(2).max(120), code: z.string().trim().max(80).default(""), learnerCount: z.coerce.number().int().min(0).max(1000000).default(0), subjects: z.array(z.string().trim().min(1).max(120)).max(50).default([]), sortOrder: z.coerce.number().int().min(0).max(10000).default(0) });
@@ -94,11 +96,25 @@ router.get("/structure", verifyInstitutionToken, async (req: InstitutionRequest,
     pool.query("SELECT category_label,level_label,learner_label,subject_label FROM institution_structure_settings WHERE institution_id=$1", [institutionId]),
     pool.query("SELECT c.*,COUNT(l.id)::int level_count FROM institution_categories c LEFT JOIN institution_levels l ON l.category_id=c.id AND l.is_active=true WHERE c.institution_id=$1 AND c.is_active=true GROUP BY c.id ORDER BY c.sort_order,c.created_at", [institutionId]),
     pool.query(`SELECT l.*,c.name category_name,(SELECT COUNT(*)::int FROM institution_questions q WHERE q.level_id=l.id) question_count FROM institution_levels l JOIN institution_categories c ON c.id=l.category_id WHERE l.institution_id=$1 AND l.is_active=true AND c.is_active=true ORDER BY l.sort_order,l.created_at`, [institutionId]),
-    pool.query("SELECT publishing_policy FROM institutions WHERE id=$1", [institutionId]),
+    pool.query("SELECT publishing_policy,questions_per_play FROM institutions WHERE id=$1", [institutionId]),
   ]);
-  return res.json({ success: true, publishingPolicy: institutionPolicy.rows[0]?.publishing_policy || "admin_review", labels: settings.rows[0] ? { category: settings.rows[0].category_label, level: settings.rows[0].level_label, learner: settings.rows[0].learner_label, subject: settings.rows[0].subject_label } : { category: "Section", level: "Class", learner: "Learners", subject: "Learning areas" }, categories: categories.rows.map(categoryShape), levels: levels.rows.map(levelShape) });
+  return res.json({ success: true, publishingPolicy: institutionPolicy.rows[0]?.publishing_policy || "admin_review", questionsPerPlay: Number(institutionPolicy.rows[0]?.questions_per_play || 10), labels: settings.rows[0] ? { category: settings.rows[0].category_label, level: settings.rows[0].level_label, learner: settings.rows[0].learner_label, subject: settings.rows[0].subject_label } : { category: "Section", level: "Class", learner: "Learners", subject: "Learning areas" }, categories: categories.rows.map(categoryShape), levels: levels.rows.map(levelShape) });
 });
 
+router.get("/practice-settings", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
+  const result = await pool.query("SELECT questions_per_play FROM institutions WHERE id=$1", [req.institution!.id]);
+  if (!result.rows[0]) return res.status(404).json({ success: false, message: "Institution not found." });
+  return res.json({ success: true, questionsPerPlay: Number(result.rows[0]?.questions_per_play || 10) });
+});
+
+router.put("/practice-settings", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
+  const parsed = InstitutionPracticeSettingsSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ success: false, message: "Questions per play must be a whole number from 1 to 200." });
+  const result = await pool.query("UPDATE institutions SET questions_per_play=$1,updated_at=NOW() WHERE id=$2 RETURNING questions_per_play", [parsed.data.questionsPerPlay, req.institution!.id]);
+  if (!result.rows[0]) return res.status(404).json({ success: false, message: "Institution not found." });
+  await logActivity({ eventType: "institution.practice_settings_updated", title: "Practice settings updated", description: `Practice sessions now show up to ${result.rows[0].questions_per_play} questions`, metadata: { institutionId: req.institution!.id, questionsPerPlay: result.rows[0].questions_per_play } });
+  return res.json({ success: true, questionsPerPlay: Number(result.rows[0].questions_per_play), message: "Practice settings saved." });
+});
 router.put("/structure/settings", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
   const parsed = StructureSettingsSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ success: false, message: "Enter valid names for each structure label." });
@@ -420,7 +436,7 @@ router.get("/dashboard", verifyInstitutionToken, async (req: InstitutionRequest,
   const institutionId = req.institution!.id;
   const [metrics, activities, requests] = await Promise.all([
     pool.query(`SELECT (SELECT COUNT(*)::int FROM institution_memberships WHERE institution_id=$1 AND status='active') students,(SELECT COUNT(*)::int FROM institution_questions WHERE institution_id=$1) questions,(SELECT COUNT(*)::int FROM institution_memberships WHERE institution_id=$1 AND status='pending') pending_requests`, [institutionId]),
-    pool.query(`SELECT id,event_type,title,description,actor_name,metadata,created_at FROM activity_logs WHERE metadata->>'institutionId'=$1 ORDER BY created_at DESC LIMIT 4`, [institutionId]),
+    pool.query(`SELECT id,event_type,title,description,actor_name,metadata,created_at FROM activity_logs WHERE metadata->>'institutionId'=$1 AND created_at >= NOW() - (COALESCE((SELECT activity_retention_days FROM institutions WHERE id=$1),15) * INTERVAL '1 day') ORDER BY created_at DESC LIMIT 4`, [institutionId]),
     pool.query(`SELECT m.id,u.name,u.username,u.email,m.requested_at FROM institution_memberships m JOIN users u ON u.id=m.user_id WHERE m.institution_id=$1 AND m.status='pending' ORDER BY m.requested_at DESC LIMIT 5`, [institutionId]),
   ]);
   return res.json({ success: true, metrics: metrics.rows[0] || { students: 0, questions: 0, pending_requests: 0 }, activities: activities.rows, requests: requests.rows });
@@ -436,7 +452,7 @@ router.get("/students/:studentId", verifyInstitutionToken, async (req: Instituti
   if (!parsedId.success) return res.status(404).json({ success: false, message: "Student not found in this institution." });
   const membership = await pool.query(
     `SELECT m.id,m.status,COALESCE(m.approved_at,m.requested_at) joined_at,u.id user_id,u.name,u.username,u.email,u.phone,u.age,u.total_xp,u.created_at,
-       (SELECT MAX(a.created_at) FROM gameplay_attempts a WHERE a.user_id=u.id) last_active
+       (SELECT MAX(a.completed_at) FROM institution_question_attempts a WHERE a.user_id=u.id AND a.institution_id=m.institution_id AND a.completed_at IS NOT NULL) last_active
      FROM institution_memberships m JOIN users u ON u.id=m.user_id
      WHERE m.id=$1 AND m.institution_id=$2 AND m.status='active'`,
     [parsedId.data, req.institution!.id],
@@ -444,15 +460,15 @@ router.get("/students/:studentId", verifyInstitutionToken, async (req: Instituti
   if (!membership.rows[0]) return res.status(404).json({ success: false, message: "Student not found in this institution." });
   const userId = membership.rows[0].user_id;
   const [summary, activity] = await Promise.all([
-    pool.query(`SELECT COUNT(*)::int attempts,COUNT(*) FILTER (WHERE passed)::int passed,ROUND(AVG(score_percent))::int average_score FROM gameplay_attempts WHERE user_id=$1`, [userId]),
-    pool.query(`SELECT a.id,a.score_percent,a.passed,a.created_at,COALESCE(g.name,l.title,'Learning activity') level_name FROM gameplay_attempts a LEFT JOIN game_levels g ON g.id=a.level_id LEFT JOIN learning_items l ON l.id=a.learning_level_id WHERE a.user_id=$1 ORDER BY a.created_at DESC LIMIT 10`, [userId]),
+    pool.query(`SELECT COUNT(*)::int attempts,COUNT(*) FILTER (WHERE is_correct IS TRUE)::int passed,ROUND(AVG(CASE WHEN is_correct IS NOT NULL THEN CASE WHEN is_correct THEN 100.0 ELSE 0.0 END END))::int average_score FROM institution_question_attempts WHERE institution_id=$1 AND user_id=$2 AND completed_at IS NOT NULL`, [req.institution!.id, userId]),
+    pool.query(`SELECT a.id,a.is_correct,a.timed_out,a.completed_at AS created_at,COALESCE(l.name,'Institution practice') level_name FROM institution_question_attempts a JOIN institution_questions q ON q.id=a.question_id AND q.institution_id=a.institution_id LEFT JOIN institution_levels l ON l.id=q.level_id WHERE a.institution_id=$1 AND a.user_id=$2 AND a.completed_at IS NOT NULL ORDER BY a.completed_at DESC LIMIT 10`, [req.institution!.id, userId]),
   ]);
   const row = membership.rows[0];
   return res.json({
     success: true,
     student: { id: row.id, name: row.name, username: row.username, email: row.email, phone: row.phone, age: row.age, totalXp: Number(row.total_xp || 0), status: row.status === "active" ? "Active" : row.status, joinedAt: row.joined_at, lastPracticeAt: row.last_active, initials: String(row.name || "IN").split(/\s+/).map(part => part[0]).join("").slice(0, 2).toUpperCase() },
     summary: { attempts: Number(summary.rows[0]?.attempts || 0), passed: Number(summary.rows[0]?.passed || 0), averageScore: summary.rows[0]?.average_score == null ? null : Number(summary.rows[0].average_score) },
-    recentActivity: activity.rows.map((item: Record<string, any>) => ({ id: item.id, activity: item.passed ? "Passed practice" : "Completed practice", levelName: item.level_name, score: Number(item.score_percent), passed: item.passed, createdAt: item.created_at })),
+    recentActivity: activity.rows.map((item: Record<string, any>) => ({ id: item.id, activity: item.timed_out ? "Timed out" : item.is_correct ? "Passed practice" : "Completed practice", levelName: item.level_name, score: item.is_correct === null ? 0 : item.is_correct ? 100 : 0, passed: item.is_correct === true, createdAt: item.created_at })),
   });
 });
 router.get("/my-learning/:institutionId", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
@@ -460,24 +476,44 @@ router.get("/my-learning/:institutionId", verifyPlayerToken, async (req: Authent
   if (!parsedId.success) return res.status(404).json({ success: false, message: "Institution not found." });
   const accountId = req.user!.accountId || req.user!.id;
   const membership = await pool.query(
-    `SELECT i.id,i.name,i.institution_type,i.city,i.state
-     FROM institution_memberships m JOIN institutions i ON i.id=m.institution_id
+    `SELECT i.id,i.name,i.institution_type,i.city,i.state,i.questions_per_play,s.category_label,s.level_label,s.learner_label,s.subject_label
+     FROM institution_memberships m JOIN institutions i ON i.id=m.institution_id LEFT JOIN institution_structure_settings s ON s.institution_id=i.id
      WHERE m.user_id=$1 AND m.institution_id=$2 AND m.status='active' AND i.is_active=true`,
     [accountId, parsedId.data],
   );
   if (!membership.rows[0]) return res.status(404).json({ success: false, message: "Active institution membership not found." });
-  const [levels, questions] = await Promise.all([
+  const [levels, areas] = await Promise.all([
     pool.query(`SELECT l.id,l.name,l.code,l.subjects,c.name category_name FROM institution_levels l JOIN institution_categories c ON c.id=l.category_id WHERE l.institution_id=$1 AND l.is_active=true AND c.is_active=true ORDER BY c.sort_order,l.sort_order,l.name`, [parsedId.data]),
-    pool.query(`SELECT q.id,q.level_id,q.subject,q.question_text,q.media_url,q.media_type,q.read_aloud,q.shape_type,q.shape_color,q.time_limit_seconds,q.created_at,COALESCE(json_agg(json_build_object('text',o.option_text,'mediaUrl',o.media_url,'mediaType',o.media_type,'shapeType',o.shape_type,'shapeColor',o.shape_color) ORDER BY o.option_order) FILTER (WHERE o.id IS NOT NULL),'[]') options FROM institution_questions q JOIN institution_levels l ON l.id=q.level_id AND l.is_active=true JOIN institution_categories c ON c.id=l.category_id AND c.is_active=true LEFT JOIN institution_question_options o ON o.question_id=q.id WHERE q.institution_id=$1 AND q.status='published' GROUP BY q.id ORDER BY q.created_at DESC`, [parsedId.data]),
+    pool.query(`SELECT q.level_id,COALESCE(NULLIF(BTRIM(q.subject),''),'General') subject,COUNT(*)::int question_count FROM institution_questions q JOIN institution_levels l ON l.id=q.level_id AND l.is_active=true JOIN institution_categories c ON c.id=l.category_id AND c.is_active=true WHERE q.institution_id=$1 AND q.status='published' GROUP BY q.level_id,COALESCE(NULLIF(BTRIM(q.subject),''),'General') ORDER BY q.level_id,subject`, [parsedId.data]),
   ]);
   return res.json({
     success: true,
-    institution: { id: membership.rows[0].id, name: membership.rows[0].name, institutionType: membership.rows[0].institution_type, city: membership.rows[0].city, state: membership.rows[0].state },
+    institution: { id: membership.rows[0].id, name: membership.rows[0].name, institutionType: membership.rows[0].institution_type, city: membership.rows[0].city, state: membership.rows[0].state, questionsPerPlay: Number(membership.rows[0].questions_per_play || 10) },
+    labels: { category: membership.rows[0].category_label || "Section", level: membership.rows[0].level_label || "Class", learner: membership.rows[0].learner_label || "Learners", subject: membership.rows[0].subject_label || "Learning areas" },
     levels: levels.rows.map((row: Record<string, any>) => ({ id: row.id, name: row.name, code: row.code, category: row.category_name, subjects: Array.isArray(row.subjects) ? row.subjects : [] })),
-    questions: questions.rows.map((row: Record<string, any>) => ({ id: row.id, levelId: row.level_id, subject: row.subject, text: row.question_text, mediaUrl: row.media_url, mediaType: row.media_type, readAloud: row.read_aloud, shapeType: row.shape_type, shapeColor: row.shape_color, timeLimitSeconds: row.time_limit_seconds, options: row.options })),
+    learningAreas: areas.rows.map((row: Record<string, any>) => ({ levelId: row.level_id, name: row.subject, questionCount: Number(row.question_count || 0) })),
   });
 });
 
+
+router.post("/my-learning/:institutionId/practice", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
+  const institutionId = z.string().uuid().safeParse(req.params.institutionId);
+  const parsed = InstitutionPracticeStartSchema.safeParse(req.body || {});
+  if (!institutionId.success || !parsed.success) return res.status(400).json({ success: false, message: "Choose a valid learning placement and area." });
+  const accountId = req.user!.accountId || req.user!.id;
+  const membership = await pool.query(
+    `SELECT i.questions_per_play FROM institutions i JOIN institution_memberships m ON m.institution_id=i.id WHERE i.id=$1 AND i.is_active=true AND m.user_id=$2 AND m.status='active'`,
+    [institutionId.data, accountId],
+  );
+  if (!membership.rows[0]) return res.status(404).json({ success: false, message: "Active institution membership not found." });
+  const result = await pool.query(
+    `SELECT q.id,q.level_id,COALESCE(NULLIF(BTRIM(q.subject),''),'General') subject,q.question_text,q.media_url,q.media_type,q.read_aloud,q.shape_type,q.shape_color,q.time_limit_seconds,COALESCE(json_agg(json_build_object('text',o.option_text,'mediaUrl',o.media_url,'mediaType',o.media_type,'shapeType',o.shape_type,'shapeColor',o.shape_color) ORDER BY o.option_order) FILTER (WHERE o.id IS NOT NULL),'[]') options
+     FROM (SELECT q.* FROM institution_questions q JOIN institution_levels l ON l.id=q.level_id AND l.is_active=true JOIN institution_categories c ON c.id=l.category_id AND c.is_active=true WHERE q.institution_id=$1 AND q.level_id=$2 AND COALESCE(NULLIF(BTRIM(q.subject),''),'General')=$3 AND q.status='published' ORDER BY random() LIMIT $4) q
+     LEFT JOIN institution_question_options o ON o.question_id=q.id GROUP BY q.id ORDER BY random()`,
+    [institutionId.data, parsed.data.levelId, parsed.data.subject, Number(membership.rows[0].questions_per_play) || 10],
+  );
+  return res.json({ success: true, questions: result.rows.map((row: Record<string, any>) => ({ id: row.id, levelId: row.level_id, subject: row.subject, text: row.question_text, mediaUrl: row.media_url, mediaType: row.media_type, readAloud: row.read_aloud, shapeType: row.shape_type, shapeColor: row.shape_color, timeLimitSeconds: row.time_limit_seconds, options: row.options })) });
+});
 router.get("/my-learning/:institutionId/history", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
   const parsedId = z.string().uuid().safeParse(req.params.institutionId);
   if (!parsedId.success) return res.status(404).json({ success: false, message: "Institution not found." });
@@ -536,6 +572,7 @@ router.post("/my-learning/:institutionId/questions/:questionId/start", verifyPla
        SELECT q.id,q.institution_id,$4,$3,NOW(),NOW() + (q.time_limit_seconds * INTERVAL '1 second')
        FROM institution_questions q
        WHERE q.id=$1 AND q.institution_id=$2 AND q.status='published'
+         AND EXISTS (SELECT 1 FROM institutions i WHERE i.id=$2 AND i.is_active=true)
          AND EXISTS (SELECT 1 FROM institution_memberships m WHERE m.institution_id=$2 AND m.user_id=$4 AND m.status='active')
          AND NOT EXISTS (SELECT 1 FROM institution_question_attempts a WHERE a.question_id=q.id AND a.user_id=$4 AND a.completed_at IS NULL)
        ON CONFLICT(user_id,question_id,attempt_key) DO UPDATE SET attempt_key=EXCLUDED.attempt_key
@@ -546,6 +583,7 @@ router.post("/my-learning/:institutionId/questions/:questionId/start", verifyPla
      SELECT a.id,a.started_at,a.expires_at FROM institution_question_attempts a
      JOIN institution_questions q ON q.id=a.question_id AND q.institution_id=a.institution_id AND q.status='published'
      WHERE a.question_id=$1 AND a.institution_id=$2 AND a.user_id=$4 AND a.completed_at IS NULL
+       AND EXISTS (SELECT 1 FROM institutions i WHERE i.id=$2 AND i.is_active=true)
        AND EXISTS (SELECT 1 FROM institution_memberships m WHERE m.institution_id=$2 AND m.user_id=$4 AND m.status='active')
      ORDER BY started_at DESC LIMIT 1`,
     [questionId.data, institutionId.data, parsedKey.data.attemptKey, accountId],
@@ -568,6 +606,7 @@ router.post("/my-learning/:institutionId/questions/:questionId/answer", verifyPl
      FROM institution_questions q JOIN institution_question_options o ON o.question_id=q.id AND o.option_order=$3
      JOIN institution_question_attempts a ON a.question_id=q.id AND a.institution_id=q.institution_id AND a.id=$5 AND a.user_id=$4
      WHERE q.id=$1 AND q.institution_id=$2 AND q.status='published'
+       AND EXISTS (SELECT 1 FROM institutions i WHERE i.id=$2 AND i.is_active=true)
        AND EXISTS (SELECT 1 FROM institution_memberships m WHERE m.institution_id=$2 AND m.user_id=$4 AND m.status='active')
      FOR UPDATE OF a`,
     [questionId.data, institutionId.data, answer.data.optionIndex, accountId, answer.data.attemptId],
@@ -606,6 +645,7 @@ router.post("/my-learning/:institutionId/questions/:questionId/finish", verifyPl
      FROM institution_questions q
      WHERE a.id=$1 AND a.question_id=$2 AND a.institution_id=$3 AND a.user_id=$4
        AND q.id=a.question_id AND q.institution_id=a.institution_id
+       AND EXISTS (SELECT 1 FROM institutions i WHERE i.id=$3 AND i.is_active=true)
        AND EXISTS (SELECT 1 FROM institution_memberships m WHERE m.institution_id=$3 AND m.user_id=$4 AND m.status='active')
      RETURNING a.id`,
     [attempt.data.attemptId, questionId.data, institutionId.data, accountId, attempt.data.timedOut],

@@ -26,8 +26,6 @@ const shape = (row: any) => ({
   questions: Number(row.questions || 0),
   questionReview: Number(row.question_review || 0),
   pendingRequests: Number(row.pending_requests || 0),
-  staff: Number(row.staff || 0),
-  sessions: Number(row.sessions || 0),
   status: row.admin_status || (row.is_active ? "Active" : "Suspended"),
   publishing: row.publishing_policy === "auto_publish" ? "Auto-publish" : "Admin review",
   joined: row.created_at,
@@ -38,8 +36,7 @@ const select = `SELECT i.id,i.name,i.owner_name,i.email,i.phone,i.city,i.state,i
   COUNT(DISTINCT q.id)::int questions,
   COUNT(DISTINCT q.id) FILTER (WHERE q.status='draft' AND q.review_status='pending')::int question_review,
   COUNT(DISTINCT pending.id)::int pending_requests,
-  1::int staff,
-  0::int sessions,i.publishing_policy
+  i.publishing_policy
   FROM institutions i LEFT JOIN institution_memberships m ON m.institution_id=i.id LEFT JOIN institution_memberships pending ON pending.institution_id=i.id AND pending.status='pending' LEFT JOIN institution_questions q ON q.institution_id=i.id`;
 
 router.get("/", verifyAdminToken, async (_req, res) => {
@@ -142,7 +139,7 @@ router.patch("/:id/status", verifyAdminToken, async (req, res) => {
   const parsed = StatusSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ success: false, message: "Choose a valid institution status." });
   const active = parsed.data.status !== "Suspended";
-  const result = await pool.query("UPDATE institutions SET admin_status=$1,is_active=$2,updated_at=NOW() WHERE id=$3 RETURNING id,name,owner_name,email,phone,city,state,country,is_active,admin_status,created_at", [parsed.data.status, active, req.params.id]);
+  const result = await pool.query("UPDATE institutions SET admin_status=$1,is_active=$2,publishing_policy=CASE WHEN $1='Needs review' THEN 'admin_review' ELSE publishing_policy END,updated_at=NOW() WHERE id=$3 RETURNING id,name,owner_name,email,phone,city,state,country,is_active,admin_status,publishing_policy,created_at", [parsed.data.status, active, req.params.id]);
   if (!result.rows[0]) return res.status(404).json({ success: false, message: "Institution not found." });
   await logActivity({ eventType: "institution.status_updated", title: "Institution status updated", description: `${result.rows[0].name} was marked ${parsed.data.status.toLowerCase()}`, metadata: { institutionId: result.rows[0].id, status: parsed.data.status } });
   return res.json({ success: true, message: `Institution marked ${parsed.data.status.toLowerCase()}.`, institution: shape(result.rows[0]) });
