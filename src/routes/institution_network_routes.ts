@@ -19,6 +19,7 @@ const StatusSchema = z.object({ status: z.enum(["active", "rejected"]) });
 const InstitutionActivityRetentionSchema = z.object({ retentionDays: z.union([z.literal(15), z.literal(30)]) });
 const InstitutionPracticeSettingsSchema = z.object({ questionsPerPlay: z.coerce.number().int().min(1).max(200) });
 const InstitutionPracticeStartSchema = z.object({ levelId: z.string().uuid(), subject: z.string().trim().min(1).max(120) });
+const InstitutionPracticeReviewSchema = z.object({ attemptIds: z.array(z.string().uuid()).min(1).max(200) });
 const StructureSettingsSchema = z.object({ categoryLabel: z.string().trim().min(2).max(80), levelLabel: z.string().trim().min(2).max(80), learnerLabel: z.string().trim().min(2).max(80), subjectLabel: z.string().trim().min(2).max(80) });
 const CategorySchema = z.object({ name: z.string().trim().min(2).max(120), description: z.string().trim().max(500).default(""), sortOrder: z.coerce.number().int().min(0).max(10000).default(0) });
 const LevelSchema = z.object({ categoryId: z.string().uuid(), name: z.string().trim().min(2).max(120), code: z.string().trim().max(80).default(""), learnerCount: z.coerce.number().int().min(0).max(1000000).default(0), subjects: z.array(z.string().trim().min(1).max(120)).max(50).default([]), sortOrder: z.coerce.number().int().min(0).max(10000).default(0) });
@@ -449,12 +450,25 @@ router.put("/activity-retention", verifyInstitutionToken, async (req: Institutio
 });
 router.get("/dashboard", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
   const institutionId = req.institution!.id;
-  const [metrics, activities, requests] = await Promise.all([
-    pool.query(`SELECT (SELECT COUNT(*)::int FROM institution_memberships WHERE institution_id=$1 AND status='active') students,(SELECT COUNT(*)::int FROM institution_questions WHERE institution_id=$1) questions,(SELECT COUNT(*)::int FROM institution_memberships WHERE institution_id=$1 AND status='pending') pending_requests`, [institutionId]),
-    pool.query(`SELECT id,event_type,title,description,actor_name,metadata,created_at FROM activity_logs WHERE metadata->>'institutionId'=$1 AND created_at >= NOW() - (COALESCE((SELECT activity_retention_days FROM institutions WHERE id=$1),15) * INTERVAL '1 day') ORDER BY created_at DESC LIMIT 4`, [institutionId]),
-    pool.query(`SELECT m.id,u.name,u.username,u.email,m.requested_at FROM institution_memberships m JOIN users u ON u.id=m.user_id WHERE m.institution_id=$1 AND m.status='pending' ORDER BY m.requested_at DESC LIMIT 5`, [institutionId]),
-  ]);
-  return res.json({ success: true, metrics: metrics.rows[0] || { students: 0, questions: 0, pending_requests: 0 }, activities: activities.rows, requests: requests.rows });
+  try {
+    let retentionDays = 15;
+    try {
+      const retention = await pool.query("SELECT activity_retention_days FROM institutions WHERE id=$1", [institutionId]);
+      retentionDays = Number(retention.rows[0]?.activity_retention_days) || retentionDays;
+    } catch (error: any) {
+      if (error?.code !== "42703") throw error;
+      console.warn("Institution dashboard using default activity retention; activity_retention_days is not present yet.");
+    }
+    const [metrics, activities, requests] = await Promise.all([
+      pool.query(`SELECT (SELECT COUNT(*)::int FROM institution_memberships WHERE institution_id=$1 AND status='active') students,(SELECT COUNT(*)::int FROM institution_questions WHERE institution_id=$1) questions,(SELECT COUNT(*)::int FROM institution_questions WHERE institution_id=$1 AND status='published') published_questions,(SELECT COUNT(*)::int FROM institution_memberships WHERE institution_id=$1 AND status='pending') pending_requests`, [institutionId]),
+      pool.query(`SELECT id,event_type,title,description,actor_name,metadata,created_at FROM activity_logs WHERE metadata->>'institutionId'=$1 AND created_at >= NOW() - ($2 * INTERVAL '1 day') ORDER BY created_at DESC LIMIT 4`, [institutionId, retentionDays]),
+      pool.query(`SELECT m.id,u.name,u.username,u.email,m.requested_at FROM institution_memberships m JOIN users u ON u.id=m.user_id WHERE m.institution_id=$1 AND m.status='pending' ORDER BY m.requested_at DESC LIMIT 5`, [institutionId]),
+    ]);
+    return res.json({ success: true, metrics: metrics.rows[0] || { students: 0, questions: 0, published_questions: 0, pending_requests: 0 }, activities: activities.rows, requests: requests.rows });
+  } catch (error) {
+    console.error("Institution dashboard request failed", error);
+    return res.status(500).json({ success: false, message: "The institution dashboard could not be loaded. Please try again." });
+  }
 });
 
 router.get("/students", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
@@ -530,6 +544,25 @@ router.post("/my-learning/:institutionId/practice", verifyPlayerToken, async (re
     [institutionId.data, parsed.data.levelId, parsed.data.subject, Number(membership.rows[0].questions_per_play) || 10],
   );
   return res.json({ success: true, questions: result.rows.map((row: Record<string, any>) => ({ id: row.id, levelId: row.level_id, subject: row.subject, text: row.question_text, mediaUrl: row.media_url, mediaType: row.media_type, readAloud: row.read_aloud, shapeType: row.shape_type, shapeColor: row.shape_color, timeLimitSeconds: row.time_limit_seconds, options: row.options })) });
+});
+router.post("/my-learning/:institutionId/practice/review", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
+  const institutionId = z.string().uuid().safeParse(req.params.institutionId);
+  const parsed = InstitutionPracticeReviewSchema.safeParse(req.body || {});
+  if (!institutionId.success || !parsed.success) return res.status(400).json({ success: false, message: "This practice review could not be loaded." });
+  const attemptIds = [...new Set(parsed.data.attemptIds)];
+  const result = await pool.query(
+    `SELECT a.id AS attempt_id,a.question_id,a.selected_option_order,a.is_correct,a.timed_out,
+            q.explanation,
+            (SELECT o.option_order FROM institution_question_options o WHERE o.question_id=q.id AND o.is_correct=true LIMIT 1) AS correct_option_order
+     FROM institution_question_attempts a
+     JOIN institution_questions q ON q.id=a.question_id AND q.institution_id=a.institution_id
+     WHERE a.id=ANY($1::uuid[]) AND a.institution_id=$2 AND a.user_id=$3
+       AND a.completed_at IS NOT NULL
+       AND EXISTS (SELECT 1 FROM institutions i WHERE i.id=$2 AND i.is_active=true)
+       AND EXISTS (SELECT 1 FROM institution_memberships m WHERE m.institution_id=$2 AND m.user_id=$3 AND m.status='active')`,
+    [attemptIds, institutionId.data, req.user!.id],
+  );
+  return res.json({ success: true, reviews: result.rows.map((row: Record<string, any>) => ({ attemptId: row.attempt_id, questionId: row.question_id, selectedOptionOrder: row.selected_option_order === null ? null : Number(row.selected_option_order), correctOptionOrder: row.correct_option_order === null ? null : Number(row.correct_option_order), correct: row.is_correct, timedOut: Boolean(row.timed_out), explanation: row.explanation || "" })) });
 });
 router.get("/my-learning/:institutionId/history", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
   const parsedId = z.string().uuid().safeParse(req.params.institutionId);
