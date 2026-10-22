@@ -22,6 +22,15 @@ const InstitutionPracticeStartSchema = z.object({ levelId: z.string().uuid(), su
 const StructureSettingsSchema = z.object({ categoryLabel: z.string().trim().min(2).max(80), levelLabel: z.string().trim().min(2).max(80), learnerLabel: z.string().trim().min(2).max(80), subjectLabel: z.string().trim().min(2).max(80) });
 const CategorySchema = z.object({ name: z.string().trim().min(2).max(120), description: z.string().trim().max(500).default(""), sortOrder: z.coerce.number().int().min(0).max(10000).default(0) });
 const LevelSchema = z.object({ categoryId: z.string().uuid(), name: z.string().trim().min(2).max(120), code: z.string().trim().max(80).default(""), learnerCount: z.coerce.number().int().min(0).max(1000000).default(0), subjects: z.array(z.string().trim().min(1).max(120)).max(50).default([]), sortOrder: z.coerce.number().int().min(0).max(10000).default(0) });
+const DeleteConfirmationSchema = z.object({ confirmationName: z.string().trim().min(1).max(120) });
+const confirmInstitutionDelete = (req: InstitutionRequest, res: any, name: string) => {
+  const parsed = DeleteConfirmationSchema.safeParse(req.body || {});
+  if (!parsed.success || parsed.data.confirmationName !== name) {
+    res.status(400).json({ success: false, code: "DELETE_NAME_CONFIRMATION_REQUIRED", message: `Type ${name} exactly to confirm deletion.` });
+    return false;
+  }
+  return true;
+};
 const institutionQuestionUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024, files: 5 }, fileFilter: (_req, file, done) => { const allowed = ["image/jpeg", "image/png", "image/gif", "image/webp", "audio/mpeg", "audio/wav", "audio/x-wav", "audio/ogg", "audio/mp4", "audio/x-m4a", "audio/aac", "video/mp4", "video/webm", "video/quicktime", "application/pdf", "text/plain", "application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"]; if (allowed.includes(file.mimetype)) done(null, true); else done(new Error("Unsupported question media type.")); } });
 const institutionCsvUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024, files: 1 }, fileFilter: (_req, file, done) => ["text/csv", "application/csv", "application/vnd.ms-excel", "text/plain", "application/octet-stream"].includes(file.mimetype) ? done(null, true) : done(new Error("Choose a CSV file.")) });
 const parseInstitutionCsvRows = (source: string) => {
@@ -148,6 +157,9 @@ router.patch("/structure/categories/:id", verifyInstitutionToken, async (req: In
 
 router.delete("/structure/categories/:id", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
   try {
+    const current = await pool.query("SELECT name FROM institution_categories WHERE id=$1 AND institution_id=$2 AND is_active=true", [req.params.id, req.institution!.id]);
+    if (!current.rows[0]) return res.status(404).json({ success: false, message: "Section not found." });
+    if (!confirmInstitutionDelete(req, res, current.rows[0].name)) return;
     const levels = await pool.query("SELECT COUNT(*)::int count FROM institution_levels WHERE category_id=$1 AND institution_id=$2 AND is_active=true", [req.params.id, req.institution!.id]);
     if (Number(levels.rows[0]?.count || 0) > 0) return res.status(409).json({ success: false, message: "Move or delete the classes in this section before deleting it." });
     const result = await pool.query("DELETE FROM institution_categories WHERE id=$1 AND institution_id=$2 RETURNING id", [req.params.id, req.institution!.id]);
@@ -187,9 +199,12 @@ router.patch("/structure/levels/:id", verifyInstitutionToken, async (req: Instit
 
 router.delete("/structure/levels/:id", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
   try {
-    const result = await pool.query("DELETE FROM institution_levels WHERE id=$1 AND institution_id=$2 RETURNING id", [req.params.id, req.institution!.id]);
+    const current = await pool.query("SELECT name FROM institution_levels WHERE id=$1 AND institution_id=$2 AND is_active=true", [req.params.id, req.institution!.id]);
+    if (!current.rows[0]) return res.status(404).json({ success: false, message: "Class not found." });
+    if (!confirmInstitutionDelete(req, res, current.rows[0].name)) return;
+    const result = await pool.query("DELETE FROM institution_levels WHERE id=$1 AND institution_id=$2 RETURNING id,name", [req.params.id, req.institution!.id]);
     if (!result.rows[0]) return res.status(404).json({ success: false, message: "Class not found." });
-    await logActivity({ eventType: "institution.level_deleted", title: "Class deleted", description: "An institution class was deleted", metadata: { institutionId: req.institution!.id, levelId: req.params.id } });
+    await logActivity({ eventType: "institution.level_deleted", title: "Class deleted", description: `${result.rows[0].name} was deleted`, metadata: { institutionId: req.institution!.id, levelId: req.params.id } });
     return res.json({ success: true, message: "Class deleted." });
   } catch { return res.status(500).json({ success: false, message: "Class could not be deleted." }); }
 });
@@ -474,12 +489,12 @@ router.get("/students/:studentId", verifyInstitutionToken, async (req: Instituti
 router.get("/my-learning/:institutionId", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
   const parsedId = z.string().uuid().safeParse(req.params.institutionId);
   if (!parsedId.success) return res.status(404).json({ success: false, message: "Institution not found." });
-  const accountId = req.user!.accountId || req.user!.id;
+  const playerId = req.user!.id;
   const membership = await pool.query(
     `SELECT i.id,i.name,i.institution_type,i.city,i.state,i.questions_per_play,s.category_label,s.level_label,s.learner_label,s.subject_label
      FROM institution_memberships m JOIN institutions i ON i.id=m.institution_id LEFT JOIN institution_structure_settings s ON s.institution_id=i.id
      WHERE m.user_id=$1 AND m.institution_id=$2 AND m.status='active' AND i.is_active=true`,
-    [accountId, parsedId.data],
+    [playerId, parsedId.data],
   );
   if (!membership.rows[0]) return res.status(404).json({ success: false, message: "Active institution membership not found." });
   const [levels, areas] = await Promise.all([
@@ -500,16 +515,18 @@ router.post("/my-learning/:institutionId/practice", verifyPlayerToken, async (re
   const institutionId = z.string().uuid().safeParse(req.params.institutionId);
   const parsed = InstitutionPracticeStartSchema.safeParse(req.body || {});
   if (!institutionId.success || !parsed.success) return res.status(400).json({ success: false, message: "Choose a valid learning placement and area." });
-  const accountId = req.user!.accountId || req.user!.id;
+  const playerId = req.user!.id;
   const membership = await pool.query(
     `SELECT i.questions_per_play FROM institutions i JOIN institution_memberships m ON m.institution_id=i.id WHERE i.id=$1 AND i.is_active=true AND m.user_id=$2 AND m.status='active'`,
-    [institutionId.data, accountId],
+    [institutionId.data, playerId],
   );
   if (!membership.rows[0]) return res.status(404).json({ success: false, message: "Active institution membership not found." });
   const result = await pool.query(
-    `SELECT q.id,q.level_id,COALESCE(NULLIF(BTRIM(q.subject),''),'General') subject,q.question_text,q.media_url,q.media_type,q.read_aloud,q.shape_type,q.shape_color,q.time_limit_seconds,COALESCE(json_agg(json_build_object('text',o.option_text,'mediaUrl',o.media_url,'mediaType',o.media_type,'shapeType',o.shape_type,'shapeColor',o.shape_color) ORDER BY o.option_order) FILTER (WHERE o.id IS NOT NULL),'[]') options
+    `SELECT q.id,q.level_id,COALESCE(NULLIF(BTRIM(q.subject),''),'General') subject,q.question_text,q.media_url,q.media_type,q.read_aloud,q.shape_type,q.shape_color,q.time_limit_seconds,
+            COALESCE((SELECT json_agg(json_build_object('text',o.option_text,'mediaUrl',o.media_url,'mediaType',o.media_type,'shapeType',o.shape_type,'shapeColor',o.shape_color) ORDER BY o.option_order)
+                      FROM institution_question_options o WHERE o.question_id=q.id),'[]') options
      FROM (SELECT q.* FROM institution_questions q JOIN institution_levels l ON l.id=q.level_id AND l.is_active=true JOIN institution_categories c ON c.id=l.category_id AND c.is_active=true WHERE q.institution_id=$1 AND q.level_id=$2 AND COALESCE(NULLIF(BTRIM(q.subject),''),'General')=$3 AND q.status='published' ORDER BY random() LIMIT $4) q
-     LEFT JOIN institution_question_options o ON o.question_id=q.id GROUP BY q.id ORDER BY random()`,
+     ORDER BY random()`,
     [institutionId.data, parsed.data.levelId, parsed.data.subject, Number(membership.rows[0].questions_per_play) || 10],
   );
   return res.json({ success: true, questions: result.rows.map((row: Record<string, any>) => ({ id: row.id, levelId: row.level_id, subject: row.subject, text: row.question_text, mediaUrl: row.media_url, mediaType: row.media_type, readAloud: row.read_aloud, shapeType: row.shape_type, shapeColor: row.shape_color, timeLimitSeconds: row.time_limit_seconds, options: row.options })) });
@@ -517,11 +534,11 @@ router.post("/my-learning/:institutionId/practice", verifyPlayerToken, async (re
 router.get("/my-learning/:institutionId/history", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
   const parsedId = z.string().uuid().safeParse(req.params.institutionId);
   if (!parsedId.success) return res.status(404).json({ success: false, message: "Institution not found." });
-  const accountId = req.user!.accountId || req.user!.id;
+  const playerId = req.user!.id;
   const membership = await pool.query(
     `SELECT 1 FROM institution_memberships m JOIN institutions i ON i.id=m.institution_id
      WHERE m.user_id=$1 AND m.institution_id=$2 AND m.status='active' AND i.is_active=true`,
-    [accountId, parsedId.data],
+    [playerId, parsedId.data],
   );
   if (!membership.rows[0]) return res.status(404).json({ success: false, message: "Active institution membership not found." });
   const requestedPage = Number(req.query.page);
@@ -530,7 +547,7 @@ router.get("/my-learning/:institutionId/history", verifyPlayerToken, async (req:
   const limit = Number.isSafeInteger(requestedLimit) && requestedLimit > 0 ? Math.min(50, requestedLimit) : 10;
   const offset = (page - 1) * limit;
   const [count, attempts] = await Promise.all([
-    pool.query("SELECT COUNT(*)::int AS total FROM institution_question_attempts WHERE institution_id=$1 AND user_id=$2 AND completed_at IS NOT NULL", [parsedId.data, accountId]),
+    pool.query("SELECT COUNT(*)::int AS total FROM institution_question_attempts WHERE institution_id=$1 AND user_id=$2 AND completed_at IS NOT NULL", [parsedId.data, playerId]),
     pool.query(
       `SELECT a.id,a.started_at,a.completed_at,a.expires_at,a.selected_option_order,a.is_correct,a.timed_out,
               q.question_text,q.subject,l.name AS level_name,o.option_text AS selected_option
@@ -540,7 +557,7 @@ router.get("/my-learning/:institutionId/history", verifyPlayerToken, async (req:
        LEFT JOIN institution_question_options o ON o.question_id=q.id AND o.option_order=a.selected_option_order
        WHERE a.institution_id=$1 AND a.user_id=$2 AND a.completed_at IS NOT NULL
        ORDER BY a.completed_at DESC,a.id DESC LIMIT $3 OFFSET $4`,
-      [parsedId.data, accountId, limit, offset],
+      [parsedId.data, playerId, limit, offset],
     ),
   ]);
   return res.json({
@@ -565,7 +582,7 @@ router.post("/my-learning/:institutionId/questions/:questionId/start", verifyPla
   const questionId = z.string().uuid().safeParse(req.params.questionId);
   const parsedKey = z.object({ attemptKey: z.string().uuid() }).safeParse(req.body || {});
   if (!institutionId.success || !questionId.success || !parsedKey.success) return res.status(400).json({ success: false, message: "This question session could not be started." });
-  const accountId = req.user!.accountId || req.user!.id;
+  const playerId = req.user!.id;
   const attempt = await pool.query(
     `WITH inserted AS (
        INSERT INTO institution_question_attempts(question_id,institution_id,user_id,attempt_key,started_at,expires_at)
@@ -586,7 +603,7 @@ router.post("/my-learning/:institutionId/questions/:questionId/start", verifyPla
        AND EXISTS (SELECT 1 FROM institutions i WHERE i.id=$2 AND i.is_active=true)
        AND EXISTS (SELECT 1 FROM institution_memberships m WHERE m.institution_id=$2 AND m.user_id=$4 AND m.status='active')
      ORDER BY started_at DESC LIMIT 1`,
-    [questionId.data, institutionId.data, parsedKey.data.attemptKey, accountId],
+    [questionId.data, institutionId.data, parsedKey.data.attemptKey, playerId],
   );
   if (!attempt.rows[0]) return res.status(404).json({ success: false, message: "Published question not found." });
   return res.json({ success: true, attempt: attempt.rows[0] });
@@ -597,7 +614,7 @@ router.post("/my-learning/:institutionId/questions/:questionId/answer", verifyPl
   const questionId = z.string().uuid().safeParse(req.params.questionId);
   const answer = z.object({ optionIndex: z.coerce.number().int().min(0).max(3), attemptId: z.string().uuid() }).safeParse(req.body || {});
   if (!institutionId.success || !questionId.success || !answer.success) return res.status(400).json({ success: false, message: "Start this question before submitting an answer." });
-  const accountId = req.user!.accountId || req.user!.id;
+  const playerId = req.user!.id;
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -609,7 +626,7 @@ router.post("/my-learning/:institutionId/questions/:questionId/answer", verifyPl
        AND EXISTS (SELECT 1 FROM institutions i WHERE i.id=$2 AND i.is_active=true)
        AND EXISTS (SELECT 1 FROM institution_memberships m WHERE m.institution_id=$2 AND m.user_id=$4 AND m.status='active')
      FOR UPDATE OF a`,
-    [questionId.data, institutionId.data, answer.data.optionIndex, accountId, answer.data.attemptId],
+    [questionId.data, institutionId.data, answer.data.optionIndex, playerId, answer.data.attemptId],
   );
   if (!result.rows[0]) { await client.query("ROLLBACK"); return res.status(404).json({ success: false, message: "Published question not found." }); }
   if (result.rows[0].completed_at) { await client.query("ROLLBACK"); return res.status(409).json({ success: false, code: "QUESTION_ATTEMPT_COMPLETE", message: "This question attempt is already complete." }); }
@@ -636,7 +653,7 @@ router.post("/my-learning/:institutionId/questions/:questionId/finish", verifyPl
   const questionId = z.string().uuid().safeParse(req.params.questionId);
   const attempt = z.object({ attemptId: z.string().uuid(), timedOut: z.boolean().optional().default(false) }).safeParse(req.body || {});
   if (!institutionId.success || !questionId.success || !attempt.success) return res.status(400).json({ success: false, message: "This question session could not be completed." });
-  const accountId = req.user!.accountId || req.user!.id;
+  const playerId = req.user!.id;
   const finished = await pool.query(
     `UPDATE institution_question_attempts a SET completed_at=COALESCE(a.completed_at,NOW()),
        timed_out=CASE WHEN $5 THEN true ELSE a.timed_out END,
@@ -648,23 +665,22 @@ router.post("/my-learning/:institutionId/questions/:questionId/finish", verifyPl
        AND EXISTS (SELECT 1 FROM institutions i WHERE i.id=$3 AND i.is_active=true)
        AND EXISTS (SELECT 1 FROM institution_memberships m WHERE m.institution_id=$3 AND m.user_id=$4 AND m.status='active')
      RETURNING a.id`,
-    [attempt.data.attemptId, questionId.data, institutionId.data, accountId, attempt.data.timedOut],
+    [attempt.data.attemptId, questionId.data, institutionId.data, playerId, attempt.data.timedOut],
   );
   if (!finished.rows[0]) return res.status(404).json({ success: false, message: "Question attempt not found." });
   return res.json({ success: true });
 });
 
 router.get("/my-learning", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
-  const accountId = req.user!.accountId || req.user!.id;
-  const memberships = await pool.query(`SELECT m.id,m.status,m.source,m.requested_at,m.approved_at,i.id institution_id,i.name institution_name,i.institution_type,i.city,i.state,i.country FROM institution_memberships m JOIN institutions i ON i.id=m.institution_id WHERE m.user_id=$1 ORDER BY m.requested_at DESC`, [accountId]);
-  const games = await pool.query(`SELECT c.id,c.name,c.description,c.image_url,a.id age_group_id,a.name age_group_name,COUNT(l.id)::int level_count FROM game_categories c JOIN age_groups a ON a.id=c.age_group_id LEFT JOIN game_levels l ON l.category_id=c.id GROUP BY c.id,a.id ORDER BY a.min_age,c.created_at`);
-  return res.json({ success: true, memberships: memberships.rows, availableGames: games.rows });
+  const playerId = req.user!.id;
+  const memberships = await pool.query(`SELECT m.id,m.status,m.source,m.requested_at,m.approved_at,i.id institution_id,i.name institution_name,i.institution_type,i.city,i.state,i.country FROM institution_memberships m JOIN institutions i ON i.id=m.institution_id WHERE m.user_id=$1 ORDER BY m.requested_at DESC`, [playerId]);
+  return res.json({ success: true, memberships: memberships.rows });
 });
 
 router.post("/:id/join-requests", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
   const parsed = JoinSchema.safeParse(req.body || {});
   if (!parsed.success) return res.status(400).json({ success: false, message: "Enter a valid institution code." });
-  const accountId = req.user!.accountId || req.user!.id;
+  const playerId = req.user!.id;
   const institution = await pool.query("SELECT id,name,is_public,invite_code FROM institutions WHERE id=$1 AND is_active=true", [req.params.id]);
   if (!institution.rows[0]) return res.status(404).json({ success: false, message: "Institution not found." });
   const target = institution.rows[0];
@@ -672,13 +688,13 @@ router.post("/:id/join-requests", verifyPlayerToken, async (req: AuthenticatedRe
   if (!target.is_public && suppliedCode !== target.invite_code) return res.status(403).json({ success: false, message: "This institution is invite-only. Enter its correct invitation code." });
   const source = suppliedCode ? "invite_code" : "public";
   try {
-    const existing = await pool.query("SELECT id,status FROM institution_memberships WHERE institution_id=$1 AND user_id=$2", [target.id, accountId]);
-    if (existing.rows[0]?.status === "active") return res.status(409).json({ success: false, message: "This account already belongs to the institution." });
+    const existing = await pool.query("SELECT id,status FROM institution_memberships WHERE institution_id=$1 AND user_id=$2", [target.id, playerId]);
+    if (existing.rows[0]?.status === "active") return res.status(409).json({ success: false, message: "This player profile already belongs to the institution." });
     if (existing.rows[0]?.status === "pending") return res.status(409).json({ success: false, message: "Your request is already waiting for institution approval." });
     const membership = existing.rows[0]
       ? await pool.query("UPDATE institution_memberships SET status='pending',source=$1,requested_at=NOW(),approved_at=NULL WHERE id=$2 RETURNING id,status,requested_at", [source, existing.rows[0].id])
-      : await pool.query("INSERT INTO institution_memberships(institution_id,user_id,status,source) VALUES($1,$2,'pending',$3) RETURNING id,status,requested_at", [target.id, accountId, source]);
-    await logActivity({ eventType: "institution.join_requested", title: "Institution join request", description: `A player requested to join ${target.name}`, actorId: accountId, metadata: { institutionId: target.id, membershipId: membership.rows[0].id, source } });
+      : await pool.query("INSERT INTO institution_memberships(institution_id,user_id,status,source) VALUES($1,$2,'pending',$3) RETURNING id,status,requested_at", [target.id, playerId, source]);
+    await logActivity({ eventType: "institution.join_requested", title: "Institution join request", description: `A player requested to join ${target.name}`, actorId: playerId, metadata: { institutionId: target.id, membershipId: membership.rows[0].id, source } });
     return res.status(201).json({ success: true, message: `Your request to join ${target.name} has been sent.`, membership: { ...membership.rows[0], institution: institutionShape(target) } });
   } catch (error) {
     console.error("Institution join request failed", error);
@@ -687,35 +703,35 @@ router.post("/:id/join-requests", verifyPlayerToken, async (req: AuthenticatedRe
 });
 
 router.get("/my-memberships", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
-  const accountId = req.user!.accountId || req.user!.id;
+  const playerId = req.user!.id;
   const result = await pool.query(
     `SELECT m.id,m.status,m.source,m.requested_at,m.approved_at,i.id institution_id,i.name,i.institution_type,i.city,i.state,i.country
      FROM institution_memberships m JOIN institutions i ON i.id=m.institution_id
-     WHERE m.user_id=$1 ORDER BY m.requested_at DESC`, [accountId],
+     WHERE m.user_id=$1 ORDER BY m.requested_at DESC`, [playerId],
   );
   return res.json({ success: true, memberships: result.rows });
 });
 
 router.delete("/my-memberships/:id", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
-  const accountId = req.user!.accountId || req.user!.id;
+  const playerId = req.user!.id;
   try {
     const result = await pool.query(
       `DELETE FROM institution_memberships
        WHERE id=$1 AND user_id=$2 AND status='pending'
        RETURNING id,institution_id`,
-      [req.params.id, accountId],
+      [req.params.id, playerId],
     );
     if (!result.rows[0]) return res.status(404).json({ success: false, message: "Only pending join requests can be canceled." });
     await logActivity({
       eventType: "institution.join_request_canceled",
       title: "Institution join request canceled",
       description: "A player canceled their pending institution join request",
-      actorId: accountId,
+      actorId: playerId,
       metadata: { institutionId: result.rows[0].institution_id, membershipId: result.rows[0].id },
     });
     return res.json({ success: true, message: "Your institution request was canceled." });
   } catch (error) {
-    console.error("Institution join request cancellation failed", { requestId: req.params.id, accountId, error });
+    console.error("Institution join request cancellation failed", { requestId: req.params.id, playerId, error });
     return res.status(500).json({ success: false, message: "Your join request could not be canceled. Please try again." });
   }
 });
