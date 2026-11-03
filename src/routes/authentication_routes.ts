@@ -543,6 +543,7 @@ router.post("/user/register", sensitiveLimiter, async (req, res) => {
   const validation = RegisterUserSchema.safeParse(req.body);
   if (!validation.success) return res.status(400).json({ success: false, errors: validation.error.issues });
   const { name, password, age } = validation.data;
+  const referralCode = validation.data.referralCode?.trim().toUpperCase();
   const email = normalizeEmail(validation.data.email);
   const phone = normalizePhone(validation.data.phone);
   if (!/^\+?[1-9]\d{6,14}$/.test(phone)) return res.status(400).json({ success: false, message: "Enter a valid phone number." });
@@ -551,12 +552,25 @@ router.post("/user/register", sensitiveLimiter, async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+    let referrerId: string | null = null;
+    if (referralCode) {
+      const enabled = await client.query("SELECT is_enabled FROM referral_settings WHERE id=1");
+      if (enabled.rows[0]?.is_enabled) {
+        const referrer = await client.query("SELECT id FROM users WHERE referral_code=$1 AND role='user' AND parent_user_id IS NULL", [referralCode]);
+        if (!referrer.rows[0]) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ success: false, message: "That referral code is not valid." });
+        }
+        referrerId = referrer.rows[0].id;
+      }
+    }
     const hashedPassword = await hashPassword(password);
     const user = await client.query(
       `INSERT INTO users (name, username, email, phone, password, age, is_verified)
        VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id,name,username,email,phone,role,is_verified`,
       [name.trim(), username, email, phone, hashedPassword, age, !env.EMAIL_VERIFICATION_ENABLED],
     );
+    if (referrerId) await client.query("INSERT INTO referrals(referrer_id,referred_user_id,referral_code) VALUES($1,$2,$3)", [referrerId,user.rows[0].id,referralCode]);
     if (env.EMAIL_VERIFICATION_ENABLED) {
       await client.query(
         `INSERT INTO otps(email,otp_code,purpose,expires_at) VALUES($1,$2,'register',NOW()+INTERVAL '15 minutes')

@@ -54,7 +54,7 @@ export const verifyAdminToken = async (req: AuthenticatedRequest, res: Response,
 
 export const requireSuperAdmin = (req: AuthenticatedRequest, res: Response, next: NextFunction): void => {
   if (req.user?.role !== 'super_admin' || req.user.id !== 'super-admin') {
-    res.status(403).json({ success: false, code: 'SUPER_ADMIN_REQUIRED', message: 'Only the Super Admin can delete catalog content.' });
+    res.status(403).json({ success: false, code: 'SUPER_ADMIN_REQUIRED', message: 'Only the Super Admin can perform this action.' });
     return;
   }
   next();

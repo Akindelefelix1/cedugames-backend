@@ -16,6 +16,7 @@ import dailyCheckinRoutes from "./daily_checkin_routes";
 import mediaRoutes from "./media_routes";
 import resourceRoutes from "./resource_routes";
 import familyPageRoutes from "./family_page_routes";
+import referralRoutes from "./referral_routes";
 import { verifyAdminToken, requireSuperAdmin, type AuthenticatedRequest } from "../middlewares/authentication_middleware";
 import {Router} from 'express';
 
@@ -44,5 +45,6 @@ router.use(dailyCheckinRoutes);
 router.use(mediaRoutes);
 router.use(resourceRoutes);
 router.use(familyPageRoutes);
+router.use(referralRoutes);
 
 export default router;
