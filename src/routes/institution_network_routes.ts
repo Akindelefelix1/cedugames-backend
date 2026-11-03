@@ -16,7 +16,7 @@ import { recordCoinTransaction } from "../services/coin_service";
 const router = Router();
 const JoinSchema = z.object({ inviteCode: z.string().trim().max(20).optional().or(z.literal("")) });
 const InvitationSchema = z.object({ target: z.string().trim().min(7).max(320) });
-const StatusSchema = z.object({ status: z.enum(["active", "rejected"]) });
+const StatusSchema = z.object({ status: z.enum(["active", "rejected"]), expectedStatus: z.enum(["pending", "rejected"]).optional() });
 const InstitutionActivityRetentionSchema = z.object({ retentionDays: z.union([z.literal(15), z.literal(30)]) });
 const InstitutionPracticeSettingsSchema = z.object({ questionsPerPlay: z.coerce.number().int().min(1).max(200) });
 const InstitutionPracticeStartSchema = z.object({ levelId: z.string().uuid(), subject: z.string().trim().min(1).max(120) });
@@ -473,8 +473,29 @@ router.get("/dashboard", verifyInstitutionToken, async (req: InstitutionRequest,
 });
 
 router.get("/students", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
-  const result = await pool.query(`SELECT m.id,u.name,u.username,u.email,m.status,m.approved_at FROM institution_memberships m JOIN users u ON u.id=m.user_id WHERE m.institution_id=$1 AND m.status='active' ORDER BY u.name`, [req.institution!.id]);
-  return res.json({ success: true, students: result.rows.map((row: Record<string, any>) => ({ id: row.id, name: row.name, username: row.username, email: row.email, className: "Not assigned", progress: 0, lastSeen: row.approved_at ? new Date(row.approved_at).toLocaleDateString() : "Not available", status: "Active", initials: String(row.name || "IN").split(/\s+/).map(part => part[0]).join("").slice(0, 2).toUpperCase() })) });
+  const result = await pool.query(`SELECT m.id,u.name,u.username,u.email,m.status,m.approved_at,
+      GREATEST(practice.last_active,attempts.last_active,m.approved_at) last_seen,
+      COALESCE(practice.average_score,attempts.average_score) average_score,
+      COALESCE(practice.level_name,attempts.level_name,'Not assigned') class_name
+    FROM institution_memberships m JOIN users u ON u.id=m.user_id
+    LEFT JOIN LATERAL (
+      SELECT MAX(p.completed_at) last_active,ROUND(AVG(p.score_percent))::int average_score,
+        (SELECT l.name FROM institution_practice_plays recent LEFT JOIN institution_levels l ON l.id=recent.level_id
+         WHERE recent.institution_id=m.institution_id AND recent.user_id=m.user_id AND recent.completed_at IS NOT NULL
+         ORDER BY recent.completed_at DESC LIMIT 1) level_name
+      FROM institution_practice_plays p WHERE p.institution_id=m.institution_id AND p.user_id=m.user_id AND p.completed_at IS NOT NULL
+    ) practice ON true
+    LEFT JOIN LATERAL (
+      SELECT MAX(a.completed_at) last_active,ROUND(AVG(CASE WHEN a.is_correct IS NOT NULL THEN CASE WHEN a.is_correct THEN 100.0 ELSE 0.0 END END))::int average_score,
+        (SELECT COALESCE(l.name,'Institution practice') FROM institution_question_attempts recent
+         JOIN institution_questions q ON q.id=recent.question_id AND q.institution_id=recent.institution_id
+         LEFT JOIN institution_levels l ON l.id=q.level_id
+         WHERE recent.institution_id=m.institution_id AND recent.user_id=m.user_id AND recent.completed_at IS NOT NULL
+         ORDER BY recent.completed_at DESC LIMIT 1) level_name
+      FROM institution_question_attempts a WHERE a.institution_id=m.institution_id AND a.user_id=m.user_id AND a.completed_at IS NOT NULL
+    ) attempts ON true
+    WHERE m.institution_id=$1 AND m.status='active' ORDER BY u.name`, [req.institution!.id]);
+  return res.json({ success: true, students: result.rows.map((row: Record<string, any>) => ({ id: row.id, name: row.name, username: row.username, email: row.email, className: row.class_name, progress: row.average_score == null ? null : Number(row.average_score), lastSeen: row.last_seen || null, status: "Active", initials: String(row.name || "IN").split(/\s+/).map(part => part[0]).join("").slice(0, 2).toUpperCase() })) });
 });
 
 router.get("/students/:studentId", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
@@ -900,7 +921,7 @@ router.post("/my-learning/:institutionId/questions/:questionId/finish", verifyPl
 
 router.get("/my-learning", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
   const playerId = req.user!.id;
-  const memberships = await pool.query(`SELECT m.id,m.status,m.source,m.requested_at,m.approved_at,i.id institution_id,i.name institution_name,i.institution_type,i.city,i.state,i.country FROM institution_memberships m JOIN institutions i ON i.id=m.institution_id WHERE m.user_id=$1 ORDER BY m.requested_at DESC`, [playerId]);
+  const memberships = await pool.query(`SELECT m.id,m.status,m.source,m.requested_at,m.approved_at,m.rejected_at,m.rejection_count,i.id institution_id,i.name institution_name,i.institution_type,i.city,i.state,i.country FROM institution_memberships m JOIN institutions i ON i.id=m.institution_id WHERE m.user_id=$1 ORDER BY m.requested_at DESC`, [playerId]);
   return res.json({ success: true, memberships: memberships.rows });
 });
 
@@ -915,12 +936,13 @@ router.post("/:id/join-requests", verifyPlayerToken, async (req: AuthenticatedRe
   if (!target.is_public && suppliedCode !== target.invite_code) return res.status(403).json({ success: false, message: "This institution is invite-only. Enter its correct invitation code." });
   const source = suppliedCode ? "invite_code" : "public";
   try {
-    const existing = await pool.query("SELECT id,status FROM institution_memberships WHERE institution_id=$1 AND user_id=$2", [target.id, playerId]);
+    const existing = await pool.query("SELECT id,status,rejected_at,rejection_count FROM institution_memberships WHERE institution_id=$1 AND user_id=$2", [target.id, playerId]);
     if (existing.rows[0]?.status === "active") return res.status(409).json({ success: false, message: "This player profile already belongs to the institution." });
     if (existing.rows[0]?.status === "pending") return res.status(409).json({ success: false, message: "Your request is already waiting for institution approval." });
     const membership = existing.rows[0]
-      ? await pool.query("UPDATE institution_memberships SET status='pending',source=$1,requested_at=NOW(),approved_at=NULL WHERE id=$2 RETURNING id,status,requested_at", [source, existing.rows[0].id])
-      : await pool.query("INSERT INTO institution_memberships(institution_id,user_id,status,source) VALUES($1,$2,'pending',$3) RETURNING id,status,requested_at", [target.id, playerId, source]);
+      ? await pool.query("UPDATE institution_memberships SET status='pending',source=$1,requested_at=NOW(),approved_at=NULL,updated_at=NOW() WHERE id=$2 AND status='rejected' RETURNING id,status,requested_at,rejected_at,rejection_count", [source, existing.rows[0].id])
+      : await pool.query("INSERT INTO institution_memberships(institution_id,user_id,status,source) VALUES($1,$2,'pending',$3) RETURNING id,status,requested_at,rejected_at,rejection_count", [target.id, playerId, source]);
+    if (!membership.rows[0]) return res.status(409).json({ success: false, message: "Your membership status changed. Refresh the institution list and try again." });
     await logActivity({ eventType: "institution.join_requested", title: "Institution join request", description: `A player requested to join ${target.name}`, actorId: playerId, metadata: { institutionId: target.id, membershipId: membership.rows[0].id, source } });
     return res.status(201).json({ success: true, message: `Your request to join ${target.name} has been sent.`, membership: { ...membership.rows[0], institution: institutionShape(target) } });
   } catch (error) {
@@ -932,7 +954,7 @@ router.post("/:id/join-requests", verifyPlayerToken, async (req: AuthenticatedRe
 router.get("/my-memberships", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
   const playerId = req.user!.id;
   const result = await pool.query(
-    `SELECT m.id,m.status,m.source,m.requested_at,m.approved_at,i.id institution_id,i.name,i.institution_type,i.city,i.state,i.country
+    `SELECT m.id,m.status,m.source,m.requested_at,m.approved_at,m.rejected_at,m.rejection_count,i.id institution_id,i.name,i.institution_type,i.city,i.state,i.country
      FROM institution_memberships m JOIN institutions i ON i.id=m.institution_id
      WHERE m.user_id=$1 ORDER BY m.requested_at DESC`, [playerId],
   );
@@ -942,12 +964,21 @@ router.get("/my-memberships", verifyPlayerToken, async (req: AuthenticatedReques
 router.delete("/my-memberships/:id", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
   const playerId = req.user!.id;
   try {
-    const result = await pool.query(
-      `DELETE FROM institution_memberships
-       WHERE id=$1 AND user_id=$2 AND status='pending'
-       RETURNING id,institution_id`,
+    const retained = await pool.query(
+      `UPDATE institution_memberships
+       SET status='rejected',approved_at=NULL,updated_at=NOW()
+       WHERE id=$1 AND user_id=$2 AND status='pending' AND rejection_count>0
+       RETURNING id,institution_id,status,requested_at,rejected_at,rejection_count`,
       [req.params.id, playerId],
     );
+    const result = retained.rows[0]
+      ? retained
+      : await pool.query(
+          `DELETE FROM institution_memberships
+           WHERE id=$1 AND user_id=$2 AND status='pending'
+           RETURNING id,institution_id`,
+          [req.params.id, playerId],
+        );
     if (!result.rows[0]) return res.status(404).json({ success: false, message: "Only pending join requests can be canceled." });
     await logActivity({
       eventType: "institution.join_request_canceled",
@@ -956,7 +987,7 @@ router.delete("/my-memberships/:id", verifyPlayerToken, async (req: Authenticate
       actorId: playerId,
       metadata: { institutionId: result.rows[0].institution_id, membershipId: result.rows[0].id },
     });
-    return res.json({ success: true, message: "Your institution request was canceled." });
+    return res.json({ success: true, message: "Your institution request was canceled.", membership: retained.rows[0] || null });
   } catch (error) {
     console.error("Institution join request cancellation failed", { requestId: req.params.id, playerId, error });
     return res.status(500).json({ success: false, message: "Your join request could not be canceled. Please try again." });
@@ -965,7 +996,7 @@ router.delete("/my-memberships/:id", verifyPlayerToken, async (req: Authenticate
 
 router.get("/requests", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
   const result = await pool.query(
-    `SELECT m.id,m.status,m.source,m.requested_at,m.approved_at,u.id user_id,u.name,u.username,u.email
+    `SELECT m.id,m.status,m.source,m.requested_at,m.approved_at,m.rejected_at,m.rejection_count,u.id user_id,u.name,u.username,u.email
      FROM institution_memberships m JOIN users u ON u.id=m.user_id
      WHERE m.institution_id=$1 ORDER BY CASE WHEN m.status='pending' THEN 0 ELSE 1 END,m.requested_at DESC`, [req.institution!.id],
   );
@@ -997,12 +1028,19 @@ router.post("/invitations", verifyInstitutionToken, async (req: InstitutionReque
 router.patch("/requests/:id", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
   const parsed = StatusSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ success: false, message: "Choose whether to approve or reject this request." });
+  const expectedStatus = parsed.data.expectedStatus || "pending";
   try {
     const result = await pool.query(
-      `UPDATE institution_memberships SET status=$1::varchar,approved_at=CASE WHEN $1::text='active' THEN NOW() ELSE NULL END
-       WHERE id=$2 AND institution_id=$3 AND status='pending' RETURNING id,status,approved_at`, [parsed.data.status, req.params.id, req.institution!.id],
+      `UPDATE institution_memberships
+       SET status=$1::varchar,
+           approved_at=CASE WHEN $1::text='active' THEN NOW() ELSE NULL END,
+           rejected_at=CASE WHEN $1::text='rejected' THEN NOW() ELSE rejected_at END,
+           rejection_count=CASE WHEN $1::text='rejected' THEN rejection_count+1 ELSE rejection_count END,
+           updated_at=NOW()
+       WHERE id=$2 AND institution_id=$3 AND status=$4
+       RETURNING id,status,approved_at,rejected_at,rejection_count`, [parsed.data.status, req.params.id, req.institution!.id, expectedStatus],
     );
-    if (!result.rows[0]) return res.status(409).json({ success: false, message: "This join request is no longer pending." });
+    if (!result.rows[0]) return res.status(409).json({ success: false, message: "This join request changed while you were reviewing it. Refresh the request list before making another decision." });
     await logActivity({ eventType: `institution.join_request_${parsed.data.status === "active" ? "approved" : "rejected"}`, title: parsed.data.status === "active" ? "Learner approved" : "Join request rejected", description: parsed.data.status === "active" ? "A learner was approved to join the institution" : "A learner join request was rejected", metadata: { institutionId: req.institution!.id, membershipId: req.params.id } });
     return res.json({ success: true, message: parsed.data.status === "active" ? "Member approved." : "Join request rejected.", membership: result.rows[0] });
   } catch (error: any) {
