@@ -3,7 +3,7 @@ import multer from "multer";
 import { verifyAdminToken, verifyPlayerToken, type AuthenticatedRequest } from "../middlewares/authentication_middleware";
 import { destroyMedia, destroyMediaQuietly, uploadMedia } from "../services/cloudinary_media_service";
 import pool from "../config/database_connection";
-import { logActivity } from "../helpers/activityLog";
+import { getAdminActor, logActivity, recordUploadEvent } from "../helpers/activityLog";
 
 const router = Router();
 const imageTypes = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
@@ -15,9 +15,11 @@ const upload = multer({
     : done(new Error("Only JPEG, PNG, GIF, and WebP images are supported.")),
 });
 
-router.post("/admin/media/images", verifyAdminToken, upload.single("image"), async (req, res) => {
+router.post("/admin/media/images", verifyAdminToken, upload.single("image"), async (req: AuthenticatedRequest, res) => {
   if (!req.file) return res.status(400).json({ success: false, message: "Select an image to upload." });
   const media = await uploadMedia(req.file, "catalog");
+  const actor = await getAdminActor(req);
+  await recordUploadEvent({ ...actor, uploadType: "catalog_image", imageCount: 1, metadata: { fileName: req.file.originalname } });
   return res.status(201).json({ success: true, url: media.url });
 });
 

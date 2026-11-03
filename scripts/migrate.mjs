@@ -23,6 +23,9 @@ try {
       const client = await pool.connect();
       try {
         await client.query("BEGIN");
+        await client.query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", [name]);
+        const alreadyApplied = await client.query("SELECT 1 FROM schema_migrations WHERE name=$1", [name]);
+        if (alreadyApplied.rows.length) { await client.query("COMMIT"); continue; }
         await client.query(source.split("-- migrate:down")[0]);
         await client.query("INSERT INTO schema_migrations(name) VALUES ($1)", [name]);
         await client.query("COMMIT");
@@ -40,10 +43,15 @@ try {
       const client = await pool.connect();
       try {
         await client.query("BEGIN");
-        await client.query(down);
-        await client.query("DELETE FROM schema_migrations WHERE name = $1", [name]);
-        await client.query("COMMIT");
-        console.log(`Rolled back ${name}`);
+        await client.query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", [name]);
+        const stillApplied = await client.query("SELECT 1 FROM schema_migrations WHERE name=$1", [name]);
+        if (!stillApplied.rows.length) { await client.query("COMMIT"); console.log(`Migration ${name} was already rolled back`); }
+        else {
+          await client.query(down);
+          await client.query("DELETE FROM schema_migrations WHERE name = $1", [name]);
+          await client.query("COMMIT");
+          console.log(`Rolled back ${name}`);
+        }
       } catch (error) { await client.query("ROLLBACK"); throw error; }
       finally { client.release(); }
     }

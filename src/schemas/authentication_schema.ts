@@ -8,6 +8,7 @@ const RegisterUserSchema = z.object({
   phone: z.string().trim().min(7).max(20),
   password: z.string().min(8).max(128),
   age: z.number().int().positive(),
+  referralCode: z.string().trim().max(16).optional().or(z.literal("")),
 });
 
 export type RegisterUserInput = z.infer<typeof RegisterUserSchema>;

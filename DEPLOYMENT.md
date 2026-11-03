@@ -6,17 +6,17 @@
 2. In ZeptoMail, verify the sending domain, create an Agent, copy its Send Mail Token, and set `ZOHO_MAIL_API_TOKEN` and `ZOHO_MAIL_FROM`.
 3. Create a Google OAuth web client and set `GOOGLE_CLIENT_ID`.
 4. Set `JWT_SECRET` to a unique secret of at least 32 characters. Never reuse the local value.
-5. Set `CORS_ORIGINS` to comma-separated production frontend origins.
+5. Set `CORS_ORIGINS` to comma-separated frontend origins without trailing slashes. Include every deployed dashboard origin, including `https://cedugames-admin.onrender.com`, `https://cedugames-user.onrender.com`, `https://cedu-institute.onrender.com`, and `https://cedu.cephassuite.com` where those apps are hosted.
 6. Point `cedu-api.cephasict.com` to the Contabo server, terminate HTTPS with a valid certificate, and reverse-proxy it to the application `PORT`.
 7. Set the admin build variable `REACT_APP_BASE_URL=https://cedu-api.cephasict.com` and the user build variable `VITE_API_URL=https://cedu-api.cephasict.com` before building the frontends.
-	For Render staging use `https://cedugames-admin.onrender.com,https://cedugames-user.onrender.com`.
+   For Render staging, include `https://cedugames-admin.onrender.com`, `https://cedugames-user.onrender.com`, `https://cedu-institute.onrender.com`, and `https://cedu.cephassuite.com` when those apps are hosted there.
 
 ## Branch deployment contract
 
 - `staging` deploys the backend and both frontends to Render.
 - `main` deploys the backend and both frontends to Contabo.
 - Set the frontend API URL at build time: `REACT_APP_BASE_URL` for the admin app and `VITE_API_URL` for the users app. Render uses `https://cedugames-backend.onrender.com`; Contabo uses `https://cedu-api.cephasict.com`.
-- Set `CORS_ORIGINS` on each backend deployment to the exact browser origins for that environment.
+- Set `CORS_ORIGINS` on each backend deployment to the exact browser origins for that environment. Keep `USER_APP_URL=https://cedu.cephassuite.com` so institution invitation emails point to the learner app, and `FLW_REDIRECT_URL=https://cedu.cephassuite.com/shop` so coin purchases return to the learner app.
 
 ## Release commands
 

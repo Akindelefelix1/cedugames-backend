@@ -28,4 +28,8 @@ services:
       - key: MAIL_SEND_TIMEOUT_MS
         value: "10000"
       - key: CORS_ORIGINS
-        sync: false
+        value: https://cedugames-admin.onrender.com,https://cedugames-user.onrender.com,https://cedu-institute.onrender.com,https://cedu.cephassuite.com
+      - key: USER_APP_URL
+        value: https://cedu.cephassuite.com
+      - key: FLW_REDIRECT_URL
+        value: https://cedu.cephassuite.com/shop

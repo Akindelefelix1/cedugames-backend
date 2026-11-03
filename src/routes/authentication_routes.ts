@@ -9,7 +9,7 @@ import { env } from "../config/env";
 import { comparePassword, hashPassword } from "../helpers/hashPassword";
 import { SendOtp } from "../helpers/Mailer";
 import { generateOtp, hashOtp } from "../helpers/otp";
-import { logActivity } from "../helpers/activityLog";
+import { getActivityRetentionDays, logActivity } from "../helpers/activityLog";
 import { verifyAdminToken, verifyPlayerToken, type AuthenticatedRequest } from "../middlewares/authentication_middleware";
 import {
   AdminLoginSchema, ForgotPasswordSchema, GoogleAuthSchema, UserLoginSchema, RegisterUserSchema,
@@ -68,9 +68,9 @@ router.post("/account-deletion-requests", sensitiveLimiter, async (req, res) => 
     return res.status(500).json({ success: false, message: "Your request could not be submitted right now. Please try again later." });
   }
 });
-const signSession = (user: { id: string; role: string; token_version: number }, rememberMe = false) =>
+const signSession = (user: { id: string; role: string; token_version: number }) =>
   jwt.sign({ id: user.id, role: user.role, ver: user.token_version }, env.JWT_SECRET, {
-    expiresIn: rememberMe ? "30d" : "24h", issuer: "cedugames-api", audience: "cedugames-client",
+    expiresIn: "24h", issuer: "cedugames-api", audience: "cedugames-client",
   });
 
 const signAdminSession = (admin: { id: string; role: string; token_version: number }) =>
@@ -149,7 +149,7 @@ router.get("/admin/users/:id", verifyAdminToken, async (req, res) => {
     const user = userResult.rows[0];
     if (!user) return res.status(404).json({ success: false, message: "User not found." });
 
-    const [performance, attempts, coinTransactions, purchases, earnedBadges, childProfiles] = await Promise.all([
+    const [performance, attempts, coinTransactions, purchases, earnedBadges, childProfiles, institutionMemberships] = await Promise.all([
       pool.query(
         `SELECT COUNT(a.id)::int attempts,
          COUNT(a.id) FILTER (WHERE a.passed)::int passed_attempts,
@@ -196,6 +196,9 @@ router.get("/admin/users/:id", verifyAdminToken, async (req, res) => {
         [user.id],
       ),
       pool.query(`SELECT id,name,username,age,profile_image_url,total_xp,coins_count,lives_remaining,created_at FROM users WHERE parent_user_id=$1 ORDER BY created_at`, [user.id]),
+      pool.query(`SELECT m.id,m.status,m.source,m.requested_at,m.approved_at,i.id institution_id,i.name institution_name,i.institution_type,i.city,i.state,i.country,i.is_public
+        FROM institution_memberships m JOIN institutions i ON i.id=m.institution_id
+        WHERE m.user_id=$1 ORDER BY m.requested_at DESC`, [user.id]),
     ]);
     return res.json({
       success: true,
@@ -208,6 +211,7 @@ router.get("/admin/users/:id", verifyAdminToken, async (req, res) => {
       recentCoinTransactions: coinTransactions.rows,
       earnedBadges: earnedBadges.rows,
       childProfiles: childProfiles.rows,
+      institutionMemberships: institutionMemberships.rows,
     });
   } catch (error) {
     console.error("Admin user profile failed", { userId, error });
@@ -221,19 +225,59 @@ router.get("/admin/activities", verifyAdminToken, async (req, res) => {
   const limit = Number.isFinite(parsedLimit) ? Math.min(Math.max(parsedLimit, 1), 100) : 20;
   const page = Number.isFinite(parsedPage) ? Math.max(parsedPage, 1) : 1;
   try {
+    const retentionDays = await getActivityRetentionDays();
     const [activities, total] = await Promise.all([
       pool.query(
         `SELECT id,event_type,title,description,actor_id,actor_name,metadata,created_at
-         FROM activity_logs ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
-        [limit, (page - 1) * limit],
+         FROM activity_logs WHERE created_at >= NOW() - ($1 * INTERVAL '1 day') ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
+        [retentionDays, limit, (page - 1) * limit],
       ),
-      pool.query("SELECT COUNT(*)::int AS count FROM activity_logs"),
+      pool.query("SELECT COUNT(*)::int AS count FROM activity_logs WHERE created_at >= NOW() - ($1 * INTERVAL '1 day')", [retentionDays]),
     ]);
     const count = total.rows[0]?.count || 0;
-    return res.json({ success: true, activities: activities.rows, pagination: { page, limit, total: count, totalPages: Math.ceil(count / limit) } });
+    return res.json({ success: true, activities: activities.rows, retentionDays, pagination: { page, limit, total: count, totalPages: Math.ceil(count / limit) } });
   } catch (error) {
     console.error("Admin activity listing failed", error);
     return res.status(500).json({ success: false, message: "Activities could not be loaded." });
+  }
+});
+
+router.get("/admin/upload-analytics", verifyAdminToken, async (req, res) => {
+  const granularity = ["day", "week", "month"].includes(String(req.query.granularity)) ? String(req.query.granularity) : "day";
+  const fallbackFrom = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+  const from = new Date(String(req.query.from || fallbackFrom.toISOString()));
+  const requestedTo = new Date(String(req.query.to || new Date().toISOString()));
+  const to = Number.isNaN(requestedTo.getTime()) ? new Date() : requestedTo;
+  if (Number.isNaN(from.getTime()) || from >= to || to.getTime() - from.getTime() > 366 * 24 * 60 * 60 * 1000) {
+    return res.status(400).json({ success: false, message: "Choose a valid date range of up to 366 days." });
+  }
+  const bucket = granularity === "day" ? "day" : granularity === "week" ? "week" : "month";
+  const page = Math.max(1, Math.floor(Number(req.query.page) || 1));
+  const limit = 15;
+  const offset = (page - 1) * limit;
+  const values = [from.toISOString(), to.toISOString()];
+  try {
+    const [summary, trend, ranking, recent, recentCount, admins] = await Promise.all([
+      pool.query(`SELECT COALESCE(SUM(question_count),0)::int total_questions,COALESCE(SUM(image_count),0)::int total_images,COUNT(DISTINCT COALESCE(actor_id::text,actor_name))::int active_admins,COUNT(*)::int upload_events FROM admin_upload_events WHERE created_at >= $1 AND created_at < $2`, values),
+      pool.query(`SELECT date_trunc('${bucket}',created_at) bucket,COALESCE(SUM(question_count),0)::int questions,COALESCE(SUM(image_count),0)::int images FROM admin_upload_events WHERE created_at >= $1 AND created_at < $2 GROUP BY 1 ORDER BY 1`, values),
+      pool.query(`SELECT COALESCE(actor_id::text,'super-admin') admin_id,MAX(actor_name) admin_name,COALESCE(SUM(question_count),0)::int questions,COALESCE(SUM(image_count),0)::int images,COUNT(*)::int upload_events,MAX(created_at) last_upload FROM admin_upload_events WHERE created_at >= $1 AND created_at < $2 GROUP BY 1 ORDER BY questions DESC,images DESC,admin_name`, values),
+      pool.query(`SELECT id,actor_id,actor_name,upload_type,question_count,image_count,metadata,created_at FROM admin_upload_events WHERE created_at >= $1 AND created_at < $2 ORDER BY created_at DESC LIMIT $3 OFFSET $4`, [...values, limit, offset]),
+      pool.query(`SELECT COUNT(*)::int total FROM admin_upload_events WHERE created_at >= $1 AND created_at < $2`, values),
+      pool.query(`SELECT id,name,email,admin_title title,is_active FROM users WHERE role='admin' ORDER BY name`),
+    ]);
+    const byId = new Map<string, any>(ranking.rows.map((row: Record<string, any>) => [row.admin_id, row] as [string, any]));
+    const leaderboard = [
+      { id: "super-admin", name: "Super Admin", email: env.SUPER_ADMIN_EMAIL, title: "Super Admin", isActive: true },
+      ...admins.rows.map((row: Record<string, any>) => ({ id: row.id, name: row.name, email: row.email, title: row.title, isActive: row.is_active })),
+    ].map((admin) => {
+      const row = byId.get(admin.id);
+      return { ...admin, questions: row?.questions || 0, images: row?.images || 0, uploadEvents: row?.upload_events || 0, lastUpload: row?.last_upload || null };
+    }).sort((a, b) => b.questions - a.questions || b.images - a.images || a.name.localeCompare(b.name));
+    return res.json({ success: true, range: { from: from.toISOString(), to: to.toISOString(), granularity }, summary: summary.rows[0], trend: trend.rows.map((row: Record<string, any>) => ({ bucket: row.bucket, questions: row.questions, images: row.images })), leaderboard, recentUploads: recent.rows, auditPagination: { page, limit, total: recentCount.rows[0]?.total || 0, totalPages: Math.ceil((recentCount.rows[0]?.total || 0) / limit) } });
+  } catch (error: any) {
+    if (error?.code === "42P01") return res.status(503).json({ success: false, message: "Upload tracking is not ready. Run npm run migrate on the backend, then redeploy." });
+    console.error("Admin upload analytics failed", error);
+    return res.status(500).json({ success: false, message: "Upload analytics could not be loaded." });
   }
 });
 
@@ -431,6 +475,7 @@ router.patch("/user/profiles/:id", verifyPlayerToken, async (req: AuthenticatedR
 });
 
 router.get("/user/dashboard-bootstrap", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
+  const retentionDays = await getActivityRetentionDays();
   const [player, preferences, notifications] = await Promise.all([
     pool.query(
       `SELECT u.id,u.name,u.username,COALESCE(parent.email,u.email) email,u.profile_image_url,u.coins_count,u.lives_remaining,u.parent_user_id,
@@ -445,11 +490,11 @@ router.get("/user/dashboard-bootstrap", verifyPlayerToken, async (req: Authentic
        FROM notifications n
        CROSS JOIN users u
        LEFT JOIN notification_reads nr ON nr.notification_id=n.id AND nr.user_id=u.id
-       WHERE u.id=$1 AND n.published_at<=NOW()
+       WHERE u.id=$1 AND n.published_at<=NOW() AND n.published_at >= NOW() - ($2 * INTERVAL '1 day')
          AND (n.audience='all' OR (n.audience='verified' AND u.is_verified=true)
            OR (n.audience='unverified' AND u.is_verified=false))
          AND nr.user_id IS NULL`,
-      [req.user!.id],
+      [req.user!.id, retentionDays],
     ),
   ]);
   if (!player.rows[0]) return res.status(404).json({ success: false, message: "Player not found." });
@@ -498,6 +543,7 @@ router.post("/user/register", sensitiveLimiter, async (req, res) => {
   const validation = RegisterUserSchema.safeParse(req.body);
   if (!validation.success) return res.status(400).json({ success: false, errors: validation.error.issues });
   const { name, password, age } = validation.data;
+  const referralCode = validation.data.referralCode?.trim().toUpperCase();
   const email = normalizeEmail(validation.data.email);
   const phone = normalizePhone(validation.data.phone);
   if (!/^\+?[1-9]\d{6,14}$/.test(phone)) return res.status(400).json({ success: false, message: "Enter a valid phone number." });
@@ -506,12 +552,25 @@ router.post("/user/register", sensitiveLimiter, async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+    let referrerId: string | null = null;
+    if (referralCode) {
+      const enabled = await client.query("SELECT is_enabled FROM referral_settings WHERE id=1");
+      if (enabled.rows[0]?.is_enabled) {
+        const referrer = await client.query("SELECT id FROM users WHERE referral_code=$1 AND role='user' AND parent_user_id IS NULL", [referralCode]);
+        if (!referrer.rows[0]) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ success: false, message: "That referral code is not valid." });
+        }
+        referrerId = referrer.rows[0].id;
+      }
+    }
     const hashedPassword = await hashPassword(password);
     const user = await client.query(
       `INSERT INTO users (name, username, email, phone, password, age, is_verified)
        VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id,name,username,email,phone,role,is_verified`,
       [name.trim(), username, email, phone, hashedPassword, age, !env.EMAIL_VERIFICATION_ENABLED],
     );
+    if (referrerId) await client.query("INSERT INTO referrals(referrer_id,referred_user_id,referral_code) VALUES($1,$2,$3)", [referrerId,user.rows[0].id,referralCode]);
     if (env.EMAIL_VERIFICATION_ENABLED) {
       await client.query(
         `INSERT INTO otps(email,otp_code,purpose,expires_at) VALUES($1,$2,'register',NOW()+INTERVAL '15 minutes')
@@ -558,7 +617,7 @@ router.post("/login", sensitiveLimiter, async (req, res) => {
     if (!matches) return res.status(401).json({ success: false, message: "Invalid email or phone number or password." });
     if (!user.is_verified) return res.status(403).json({ success: false, message: "Verify your email before signing in." });
     await logActivity({ eventType: "user.signed_in", title: "User signed in", description: `${user.name} signed in`, actorId: user.id, actorName: user.name });
-    return res.json({ success: true, message: "Sign in successful.", token: signSession(user, validation.data.rememberMe), user: { id: user.id, name: user.name, username: user.username, email: user.email, phone: user.phone, role: user.role, profile_image_url: user.profile_image_url } });
+    return res.json({ success: true, message: "Sign in successful.", token: signSession(user), user: { id: user.id, name: user.name, username: user.username, email: user.email, phone: user.phone, role: user.role, profile_image_url: user.profile_image_url } });
   } catch (error) {
     console.error("Login failed", error);
     return res.status(500).json({ success: false, message: "Sign in could not be completed." });
