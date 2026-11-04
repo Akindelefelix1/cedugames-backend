@@ -92,3 +92,23 @@ export const SendInstitutionInvitation = async (email: string, institutionName: 
   if (!response.ok) throw new Error(result.error?.message || result.message || `Invitation email failed with HTTP ${response.status}`);
   console.log(JSON.stringify({ level: "info", event: "institution_invitation_email_sent", requestId: result.request_id }));
 };
+
+export const SendInstitutionStaffInvitation = async (email: string, institutionName: string, role: string, inviteLink: string): Promise<void> => {
+  if (!env.ZOHO_MAIL_API_TOKEN || !env.ZOHO_MAIL_FROM) throw new Error("Email delivery is not configured");
+  const sendMailToken = env.ZOHO_MAIL_API_TOKEN.trim().replace(/^zoho-enczapikey\s+/i, "").replace(/^['"]|['"]$/g, "");
+  const safeName = institutionName.replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[character]!));
+  const safeRole = role.replace(/_/g, " ");
+  const response = await fetch(env.ZOHO_MAIL_API_URL, {
+    method: "POST",
+    headers: { accept: "application/json", Authorization: `Zoho-enczapikey ${sendMailToken}`, "content-type": "application/json" },
+    signal: AbortSignal.timeout(env.MAIL_SEND_TIMEOUT_MS),
+    body: JSON.stringify({
+      subject: `Staff invitation from ${institutionName}`,
+      from: { name: env.ZOHO_MAIL_FROM_NAME, address: env.ZOHO_MAIL_FROM },
+      to: [{ email_address: { address: email, name: email } }],
+      htmlbody: `<div style="font-family:Arial,sans-serif;max-width:560px;padding:24px;color:#142038"><h2 style="color:#7442ae">Join ${safeName} on Cedu</h2><p>You have been invited as a <strong>${safeRole}</strong>.</p><p><a href="${inviteLink}" style="display:inline-block;background:#7442ae;color:#fff;padding:12px 18px;border-radius:8px;text-decoration:none;font-weight:bold">Accept staff invitation</a></p><p style="font-size:12px;color:#718096">This invitation expires in 7 days. Ignore it if you were not expecting it.</p></div>`,
+    }),
+  });
+  const result = await response.json() as { message?: string; request_id?: string; error?: { message?: string } };
+  if (!response.ok) throw new Error(result.error?.message || result.message || `Staff invitation email failed with HTTP ${response.status}`);
+};

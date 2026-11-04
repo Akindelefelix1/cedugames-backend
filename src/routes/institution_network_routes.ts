@@ -78,13 +78,13 @@ const institutionShapeSchema = z.object({ type: z.enum(["circle", "square", "rec
 const jsonShape = z.string().transform((value, ctx) => { try { return institutionShapeSchema.parse(JSON.parse(value)); } catch { ctx.addIssue({ code: "custom", message: "Invalid shape selection." }); return z.NEVER; } });
 const institutionOptionSchema = z.object({ text: z.string().trim().max(5000), isCorrect: z.boolean(), mediaType: z.enum(["image", "audio", "video", "document"]).nullable(), shape: jsonShape });
 const InstitutionQuestionSchema = z.object({ subject: z.string().trim().min(1).max(120), timeLimitSeconds: z.coerce.number().int().min(5).max(600).default(30), questionText: z.string().max(10000).default(""), explanation: z.string().max(5000).default(""), questionShape: jsonShape, questionMediaType: z.enum(["", "image", "audio", "video", "document"]).default(""), readAloud: z.enum(["true", "false"]).default("false").transform(value => value === "true"), options: z.string().transform((value, ctx) => { try { return z.array(institutionOptionSchema).length(4).parse(JSON.parse(value)); } catch { ctx.addIssue({ code: "custom", message: "Four valid answer options are required." }); return z.NEVER; } }), status: z.enum(["draft", "published"]).default("draft") }).refine(data => data.options.filter(option => option.isCorrect).length === 1, { message: "Exactly one answer option must be marked correct." });
-const institutionShape = (row: any) => ({ id: row.id, name: row.name, institutionType: row.institution_type, city: row.city, state: row.state, country: row.country, address: row.address, isPublic: row.is_public });
+const institutionShape = (row: any) => ({ id: row.id, name: row.name, institutionType: row.institution_type, city: row.city, state: row.state, country: row.country, address: row.address, logoUrl: row.logo_url || null, isPublic: row.is_public });
 const categoryShape = (row: any) => ({ id: row.id, name: row.name, description: row.description || "", levels: Number(row.level_count || 0), sortOrder: Number(row.sort_order || 0), tone: row.tone || "purple" });
 const levelShape = (row: any) => ({ id: row.id, categoryId: row.category_id, category: row.category_name, name: row.name, code: row.code || "", learners: Number(row.learner_count || 0), subjects: Array.isArray(row.subjects) ? row.subjects : [], sortOrder: Number(row.sort_order || 0), status: row.is_active ? "Active" : "Inactive", questions: Number(row.question_count || 0), progress: 0 });
 
 router.get("/public", async (_req, res) => {
   const result = await pool.query(
-    `SELECT id,name,institution_type,address,city,state,country,is_public
+    `SELECT id,name,institution_type,address,city,state,country,logo_url,is_public
      FROM institutions WHERE is_active=true AND is_public=true ORDER BY name LIMIT 100`,
   );
   return res.json({ success: true, institutions: result.rows.map(institutionShape) });
@@ -94,7 +94,7 @@ router.get("/code/:code", async (req, res) => {
   const code = String(req.params.code || "").trim().toUpperCase();
   if (!/^CEDU-[A-Z0-9]{8}$/.test(code)) return res.status(400).json({ success: false, message: "Enter a valid institution code." });
   const result = await pool.query(
-    `SELECT id,name,institution_type,address,city,state,country,is_public
+    `SELECT id,name,institution_type,address,city,state,country,logo_url,is_public
      FROM institutions WHERE is_active=true AND upper(invite_code)=$1`, [code],
   );
   if (!result.rows[0]) return res.status(404).json({ success: false, message: "No institution was found for that code." });
@@ -354,7 +354,8 @@ router.patch("/questions/:id/resubmit", verifyInstitutionToken, institutionQuest
 });
 
 router.get("/questions", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
-  const result = await pool.query(`SELECT q.id,q.level_id,q.subject,q.question_text,q.explanation,q.status,q.review_status,q.review_notes,q.created_at,q.updated_at,q.media_url,q.media_type,q.read_aloud,q.shape_type,q.shape_color,q.time_limit_seconds,COALESCE(json_agg(json_build_object('text',o.option_text,'isCorrect',o.is_correct,'mediaUrl',o.media_url,'mediaType',o.media_type,'shapeType',o.shape_type,'shapeColor',o.shape_color) ORDER BY o.option_order) FILTER (WHERE o.id IS NOT NULL),'[]') options,l.name level_name,c.name category_name FROM institution_questions q JOIN institution_levels l ON l.id=q.level_id JOIN institution_categories c ON c.id=l.category_id LEFT JOIN institution_question_options o ON o.question_id=q.id WHERE q.institution_id=$1 GROUP BY q.id,l.name,c.name ORDER BY q.created_at DESC`, [req.institution!.id]);
+  const teacher = req.institution?.role === "institution_staff" && req.institution.staffRole === "teacher";
+  const result = await pool.query(`SELECT q.id,q.level_id,q.subject,q.question_text,q.explanation,q.status,q.review_status,q.review_notes,q.created_at,q.updated_at,q.media_url,q.media_type,q.read_aloud,q.shape_type,q.shape_color,q.time_limit_seconds,COALESCE(json_agg(json_build_object('text',o.option_text,'isCorrect',o.is_correct,'mediaUrl',o.media_url,'mediaType',o.media_type,'shapeType',o.shape_type,'shapeColor',o.shape_color) ORDER BY o.option_order) FILTER (WHERE o.id IS NOT NULL),'[]') options,l.name level_name,c.name category_name FROM institution_questions q JOIN institution_levels l ON l.id=q.level_id JOIN institution_categories c ON c.id=l.category_id LEFT JOIN institution_question_options o ON o.question_id=q.id WHERE q.institution_id=$1 AND ($2::boolean=false OR q.status='published') GROUP BY q.id,l.name,c.name ORDER BY q.created_at DESC`, [req.institution!.id, teacher]);
   return res.json({ success: true, questions: result.rows.map((row: Record<string, any>) => ({ id: row.id, levelId: row.level_id, text: row.question_text, explanation: row.explanation, subject: row.subject, level: row.level_name, section: row.category_name, type: "Multiple choice", status: row.status === "published" ? "Published" : ["pending", "changes_requested"].includes(row.review_status) ? "Needs review" : "Draft", reviewNotes: row.review_notes || "", updated: row.updated_at, plays: 0, mediaUrl: row.media_url, mediaType: row.media_type, readAloud: row.read_aloud, shapeType: row.shape_type, shapeColor: row.shape_color, timeLimitSeconds: row.time_limit_seconds, options: row.options })) });
 });
 
@@ -527,7 +528,7 @@ router.get("/my-learning/:institutionId", verifyPlayerToken, async (req: Authent
   if (!parsedId.success) return res.status(404).json({ success: false, message: "Institution not found." });
   const playerId = req.user!.id;
   const membership = await pool.query(
-    `SELECT i.id,i.name,i.institution_type,i.city,i.state,i.questions_per_play,s.category_label,s.level_label,s.learner_label,s.subject_label
+    `SELECT i.id,i.name,i.institution_type,i.city,i.state,i.country,i.address,i.logo_url,i.questions_per_play,s.category_label,s.level_label,s.learner_label,s.subject_label
      FROM institution_memberships m JOIN institutions i ON i.id=m.institution_id LEFT JOIN institution_structure_settings s ON s.institution_id=i.id
      WHERE m.user_id=$1 AND m.institution_id=$2 AND m.status='active' AND i.is_active=true`,
     [playerId, parsedId.data],
@@ -539,7 +540,7 @@ router.get("/my-learning/:institutionId", verifyPlayerToken, async (req: Authent
   ]);
   return res.json({
     success: true,
-    institution: { id: membership.rows[0].id, name: membership.rows[0].name, institutionType: membership.rows[0].institution_type, city: membership.rows[0].city, state: membership.rows[0].state, questionsPerPlay: Number(membership.rows[0].questions_per_play || 10) },
+    institution: { id: membership.rows[0].id, name: membership.rows[0].name, institutionType: membership.rows[0].institution_type, city: membership.rows[0].city, state: membership.rows[0].state, country: membership.rows[0].country, address: membership.rows[0].address, logoUrl: membership.rows[0].logo_url || null, questionsPerPlay: Number(membership.rows[0].questions_per_play || 10) },
     labels: { category: membership.rows[0].category_label || "Section", level: membership.rows[0].level_label || "Class", learner: membership.rows[0].learner_label || "Learners", subject: membership.rows[0].subject_label || "Learning areas" },
     levels: levels.rows.map((row: Record<string, any>) => ({ id: row.id, name: row.name, code: row.code, category: row.category_name, subjects: Array.isArray(row.subjects) ? row.subjects : [] })),
     learningAreas: areas.rows.map((row: Record<string, any>) => ({ levelId: row.level_id, name: row.subject, questionCount: Number(row.question_count || 0) })),
@@ -723,7 +724,11 @@ router.get("/my-learning/:institutionId/history", verifyPlayerToken, async (req:
        LEFT JOIN LATERAL (
          SELECT json_agg(json_build_object(
            'id',a.id,'question',q.question_text,'selectedOption',o.option_text,
-           'correct',a.is_correct,'timedOut',a.timed_out,'startedAt',a.started_at,'completedAt',a.completed_at
+           'selectedOptionOrder',a.selected_option_order,
+           'correctOptionOrder',(SELECT choice.option_order FROM institution_question_options choice WHERE choice.question_id=q.id AND choice.is_correct=true LIMIT 1),
+           'options',(SELECT COALESCE(json_agg(json_build_object('text',choice.option_text,'isCorrect',choice.is_correct,'mediaUrl',choice.media_url,'mediaType',choice.media_type,'shapeType',choice.shape_type,'shapeColor',choice.shape_color) ORDER BY choice.option_order),'[]'::json) FROM institution_question_options choice WHERE choice.question_id=q.id),
+           'questionMediaUrl',q.media_url,'questionMediaType',q.media_type,'questionShapeType',q.shape_type,'questionShapeColor',q.shape_color,
+           'explanation',q.explanation,'correct',a.is_correct,'timedOut',a.timed_out,'startedAt',a.started_at,'completedAt',a.completed_at
          ) ORDER BY a.started_at,a.id) AS attempts
          FROM institution_question_attempts a
          JOIN institution_questions q ON q.id=a.question_id AND q.institution_id=a.institution_id
@@ -921,7 +926,7 @@ router.post("/my-learning/:institutionId/questions/:questionId/finish", verifyPl
 
 router.get("/my-learning", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
   const playerId = req.user!.id;
-  const memberships = await pool.query(`SELECT m.id,m.status,m.source,m.requested_at,m.approved_at,m.rejected_at,m.rejection_count,i.id institution_id,i.name institution_name,i.institution_type,i.city,i.state,i.country FROM institution_memberships m JOIN institutions i ON i.id=m.institution_id WHERE m.user_id=$1 ORDER BY m.requested_at DESC`, [playerId]);
+  const memberships = await pool.query(`SELECT m.id,m.status,m.source,m.requested_at,m.approved_at,m.rejected_at,m.rejection_count,i.id institution_id,i.name institution_name,i.institution_type,i.city,i.state,i.country,i.logo_url institution_logo_url FROM institution_memberships m JOIN institutions i ON i.id=m.institution_id WHERE m.user_id=$1 ORDER BY m.requested_at DESC`, [playerId]);
   return res.json({ success: true, memberships: memberships.rows });
 });
 
@@ -954,7 +959,7 @@ router.post("/:id/join-requests", verifyPlayerToken, async (req: AuthenticatedRe
 router.get("/my-memberships", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
   const playerId = req.user!.id;
   const result = await pool.query(
-    `SELECT m.id,m.status,m.source,m.requested_at,m.approved_at,m.rejected_at,m.rejection_count,i.id institution_id,i.name,i.institution_type,i.city,i.state,i.country
+    `SELECT m.id,m.status,m.source,m.requested_at,m.approved_at,m.rejected_at,m.rejection_count,i.id institution_id,i.name institution_name,i.institution_type,i.city,i.state,i.country,i.logo_url institution_logo_url
      FROM institution_memberships m JOIN institutions i ON i.id=m.institution_id
      WHERE m.user_id=$1 ORDER BY m.requested_at DESC`, [playerId],
   );
@@ -1004,6 +1009,7 @@ router.get("/requests", verifyInstitutionToken, async (req: InstitutionRequest, 
 });
 
 router.post("/invitations", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
+  if (req.institution?.role !== "institution_owner") return res.status(403).json({ success: false, message: "Only an institution owner can create learner invitations." });
   const parsed = InvitationSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ success: false, message: "Enter a valid email address or phone number." });
   const target = parsed.data.target.trim();
@@ -1013,13 +1019,22 @@ router.post("/invitations", verifyInstitutionToken, async (req: InstitutionReque
   const channel = isEmail ? "email" : "phone";
   const institution = await pool.query("SELECT id,name,invite_code FROM institutions WHERE id=$1 AND is_active=true", [req.institution!.id]);
   if (!institution.rows[0]) return res.status(404).json({ success: false, message: "Institution not found." });
+  const normalizedTarget = isEmail ? target.toLowerCase() : target.replace(/[\s()-]/g, "");
   const inviteLink = `${env.USER_APP_URL}/institutions?code=${encodeURIComponent(institution.rows[0].invite_code)}`;
+  let invitationId = "";
   try {
+    await pool.query("UPDATE institution_invitations SET status='canceled' WHERE institution_id=$1 AND status='sent' AND expires_at<=NOW()", [req.institution!.id]);
+    const duplicate = await pool.query("SELECT id FROM institution_invitations WHERE institution_id=$1 AND lower(target)=lower($2) AND status='sent' LIMIT 1", [req.institution!.id, normalizedTarget]);
+    if (duplicate.rows[0]) return res.status(409).json({ success: false, message: "An invitation to this contact is already active. It expires after 7 days." });
+    const saved = await pool.query("INSERT INTO institution_invitations(institution_id,target,channel,expires_at) VALUES($1,$2,$3,NOW()+INTERVAL '7 days') RETURNING id,channel,created_at,expires_at", [req.institution!.id, normalizedTarget, channel]);
+    invitationId = saved.rows[0].id;
     if (isEmail) await SendInstitutionInvitation(target.toLowerCase(), institution.rows[0].name, inviteLink);
-    const saved = await pool.query("INSERT INTO institution_invitations(institution_id,target,channel) VALUES($1,$2,$3) RETURNING id,channel,created_at", [req.institution!.id, isEmail ? target.toLowerCase() : target.replace(/[\s()-]/g, ""), channel]);
-    await logActivity({ eventType: "institution.invitation_sent", title: "Institution invitation sent", description: `An institution invitation was prepared for a ${channel} contact`, metadata: { institutionId: req.institution!.id, invitationId: saved.rows[0].id, channel } });
+    try { await logActivity({ eventType: "institution.invitation_sent", title: "Institution invitation sent", description: `An institution invitation was prepared for a ${channel} contact`, metadata: { institutionId: req.institution!.id, invitationId, channel } }); }
+    catch (activityError) { console.error("Institution invitation activity logging failed", activityError); }
     return res.status(201).json({ success: true, channel, inviteLink, message: isEmail ? "Invitation email sent." : "SMS invitation ready to send." });
   } catch (error: any) {
+    if (error?.code === "23505") return res.status(409).json({ success: false, message: "An invitation to this contact is already active. It expires after 7 days." });
+    if (invitationId) await pool.query("DELETE FROM institution_invitations WHERE id=$1 AND status='sent'", [invitationId]).catch(() => undefined);
     console.error("Institution invitation failed", { institutionId: req.institution!.id, channel, error });
     return res.status(502).json({ success: false, message: isEmail ? "Invitation email could not be sent. Check email delivery settings." : "The phone invitation could not be prepared." });
   }
