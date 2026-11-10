@@ -17,4 +17,4 @@ COPY --from=build --chown=node:node /app/dist ./dist
 COPY --chown=node:node scripts ./scripts
 COPY --chown=node:node migrations ./migrations
 EXPOSE 8000
-CMD ["node", "dist/server.js"]
+CMD ["npm", "start"]

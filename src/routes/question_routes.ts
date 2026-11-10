@@ -40,11 +40,14 @@ const bodySchema = z.object({
   questionText: z.string().trim().max(10000).default(""), explanation: z.string().trim().max(5000).default(""), shape: z.string().default("null").transform((value, ctx) => { try { return shapeSchema.parse(JSON.parse(value)); } catch { ctx.addIssue({ code: "custom", message: "Invalid question shape." }); return z.NEVER; } }),
   ageGroupId: z.string().uuid().optional(), categoryId: z.string().uuid().optional(), levelId: z.string().uuid().optional(), learningLevelId: z.string().uuid().optional(),
   status: z.enum(["draft", "published"]).default("published"),
+  isMagic: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),
+  magicRewardCoins: z.coerce.number().int().min(0).max(1000000).default(0),
   readAloud: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),
   questionMediaType: z.enum(["", "image", "audio", "video", "document"]).default(""),
   questionResourceUrl: z.string().url().optional(),
   options: z.string().transform((value, ctx) => { try { return z.array(optionSchema).length(4).parse(JSON.parse(value)); } catch { ctx.addIssue({ code: "custom", message: "Four valid options are required." }); return z.NEVER; } }),
-}).refine((value) => Boolean(value.learningLevelId) || Boolean(value.ageGroupId && value.categoryId && value.levelId), { message: "Select a valid question placement." });
+}).refine((value) => Boolean(value.learningLevelId) || Boolean(value.ageGroupId && value.categoryId && value.levelId), { message: "Select a valid question placement." })
+  .refine((value) => value.isMagic ? value.magicRewardCoins > 0 : value.magicRewardCoins === 0, { message: "Magic questions need a coin reward; regular questions must have no magic reward." });
 const bulkHeaderNames = ["Questions", "Option A", "Option B", "Option C", "Option D", "Correct Answer"] as const;
 const bulkQuestionSchema = z.object({
   question: z.string().trim().min(1).max(500),
@@ -110,7 +113,10 @@ router.post("/admin/questions/bulk", verifyAdminToken, upload.single("file"), as
   const placement = z.object({
     ageGroupId: z.string().uuid().optional(), categoryId: z.string().uuid().optional(), levelId: z.string().uuid().optional(), learningLevelId: z.string().uuid().optional(),
     status: z.enum(["draft", "published"]).default("published"),
-  }).refine((value) => Boolean(value.learningLevelId) || Boolean(value.ageGroupId && value.categoryId && value.levelId), { message: "Select a valid question placement." }).safeParse(req.body);
+    isMagic: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),
+    magicRewardCoins: z.coerce.number().int().min(0).max(1000000).default(0),
+  }).refine((value) => Boolean(value.learningLevelId) || Boolean(value.ageGroupId && value.categoryId && value.levelId), { message: "Select a valid question placement." })
+    .refine((value) => value.isMagic ? value.magicRewardCoins > 0 : value.magicRewardCoins === 0, { message: "Magic questions need a coin reward; regular questions must have no magic reward." }).safeParse(req.body);
   if (!placement.success) return res.status(400).json({ success: false, message: "Select a valid CEDU or CEDU-LEARN level." });
   if (!req.file) return res.status(400).json({ success: false, message: "Choose a CSV file to upload." });
   const parsed = parseBulkQuestions(req.file.buffer.toString("utf8"));
@@ -131,9 +137,9 @@ router.post("/admin/questions/bulk", verifyAdminToken, upload.single("file"), as
     await client.query("BEGIN");
     for (const question of parsed.questions) {
       const inserted = await client.query(
-        `INSERT INTO questions(age_group_id,category_id,level_id,learning_level_id,question_text,explanation,status)
-         VALUES($1,$2,$3,$4,$5,'',$6) RETURNING id`,
-        [placement.data.ageGroupId || null, placement.data.categoryId || null, placement.data.levelId || null, placement.data.learningLevelId || null, question.question, placement.data.status],
+        `INSERT INTO questions(age_group_id,category_id,level_id,learning_level_id,question_text,explanation,status,is_magic,magic_reward_coins)
+         VALUES($1,$2,$3,$4,$5,'',$6,$7,$8) RETURNING id`,
+        [placement.data.ageGroupId || null, placement.data.categoryId || null, placement.data.levelId || null, placement.data.learningLevelId || null, question.question, placement.data.status, placement.data.isMagic, placement.data.magicRewardCoins],
       );
       for (let index = 0; index < question.options.length; index += 1) {
         await client.query(
@@ -206,7 +212,7 @@ router.post("/admin/questions", verifyAdminToken, upload.fields(fields), async (
     await assertResourceUrls(client, [data.questionResourceUrl, ...data.options.map((option) => option.mediaUrl)]);
     cloudFiles = await storeFiles(fileMap);
     await Promise.all(Object.keys(fileMap).map((field) => registerImageResource(storedMedia(cloudFiles, field), fileMap[field]?.[0], client)));
-    const inserted = await client.query(`INSERT INTO questions(age_group_id,category_id,level_id,learning_level_id,question_text,explanation,media_url,media_type,status,read_aloud,shape_type,shape_color) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`, [data.ageGroupId||null, data.categoryId||null, data.levelId||null, data.learningLevelId||null, questionText, data.explanation, storedMedia(cloudFiles, "questionMedia")?.url || data.questionResourceUrl || null, questionFile || data.questionResourceUrl ? data.questionMediaType : null, data.status, data.readAloud, data.shape?.type || null, data.shape?.color || null]);
+    const inserted = await client.query(`INSERT INTO questions(age_group_id,category_id,level_id,learning_level_id,question_text,explanation,media_url,media_type,status,read_aloud,shape_type,shape_color,is_magic,magic_reward_coins) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`, [data.ageGroupId||null, data.categoryId||null, data.levelId||null, data.learningLevelId||null, questionText, data.explanation, storedMedia(cloudFiles, "questionMedia")?.url || data.questionResourceUrl || null, questionFile || data.questionResourceUrl ? data.questionMediaType : null, data.status, data.readAloud, data.shape?.type || null, data.shape?.color || null, data.isMagic, data.magicRewardCoins]);
     for (let index = 0; index < data.options.length; index += 1) {
       const option = data.options[index]!; const file = fileMap[`optionMedia${index}`]?.[0];
       await client.query(`INSERT INTO question_options(question_id,option_order,option_text,media_url,media_type,is_correct,shape_type,shape_color) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, [inserted.rows[0].id, index, optionTexts[index], storedMedia(cloudFiles, `optionMedia${index}`)?.url || option.mediaUrl || null, file || option.mediaUrl ? option.mediaType : null, option.isCorrect, option.shape?.type || null, option.shape?.color || null]);
@@ -238,14 +244,14 @@ router.get("/admin/questions", verifyAdminToken, async (req, res) => {
   const offsetParameter = search ? "$3" : "$2";
 
   const [result, countResult] = await Promise.all([
-    pool.query(`SELECT q.id,q.question_text,q.status,q.created_at,q.age_group_id,q.category_id,q.level_id,c.name category_name,l.name level_name,l.level_number FROM questions q JOIN game_categories c ON c.id=q.category_id JOIN game_levels l ON l.id=q.level_id ${where} ORDER BY q.created_at DESC,q.id DESC LIMIT ${limitParameter} OFFSET ${offsetParameter}`, values),
+    pool.query(`SELECT q.id,q.question_text,q.status,q.is_magic,q.magic_reward_coins,q.created_at,q.age_group_id,q.category_id,q.level_id,c.name category_name,l.name level_name,l.level_number FROM questions q JOIN game_categories c ON c.id=q.category_id JOIN game_levels l ON l.id=q.level_id ${where} ORDER BY q.created_at DESC,q.id DESC LIMIT ${limitParameter} OFFSET ${offsetParameter}`, values),
     pool.query(`SELECT COUNT(*)::int total FROM questions q JOIN game_categories c ON c.id=q.category_id JOIN game_levels l ON l.id=q.level_id ${where}`, search ? [searchPattern] : []),
   ]);
   const total = countResult.rows[0]?.total || 0;
 
   return res.json({
     success: true,
-    questions: result.rows.map((row: Record<string, any>) => ({ id: row.id, text: plainText(row.question_text) || "Visual question", status: row.status, createdAt: row.created_at, ageGroupId: row.age_group_id, categoryId: row.category_id, category: row.category_name, levelId: row.level_id, level: row.level_name, levelNumber: row.level_number })),
+    questions: result.rows.map((row: Record<string, any>) => ({ id: row.id, text: plainText(row.question_text) || "Visual question", status: row.status, isMagic: row.is_magic, magicRewardCoins: row.magic_reward_coins, createdAt: row.created_at, ageGroupId: row.age_group_id, categoryId: row.category_id, category: row.category_name, levelId: row.level_id, level: row.level_name, levelNumber: row.level_number })),
     pagination: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) },
   });
 });
@@ -254,7 +260,7 @@ router.get("/admin/questions/:id", verifyAdminToken, async (req, res) => {
   const result = await pool.query(`SELECT q.*,COALESCE(json_agg(json_build_object('id',o.id,'text',o.option_text,'mediaUrl',o.media_url,'mediaType',o.media_type,'isCorrect',o.is_correct,'shapeType',o.shape_type,'shapeColor',o.shape_color) ORDER BY o.option_order) FILTER (WHERE o.id IS NOT NULL),'[]') options FROM questions q LEFT JOIN question_options o ON o.question_id=q.id WHERE q.id=$1 GROUP BY q.id`, [req.params.id]);
   const row = result.rows[0];
   if (!row) return res.status(404).json({ success: false, message: "Question not found." });
-  return res.json({ success: true, question: { id: row.id, ageGroupId: row.age_group_id, categoryId: row.category_id, levelId: row.level_id, learningLevelId: row.learning_level_id, text: row.question_text, explanation: row.explanation, mediaUrl: row.media_url, mediaType: row.media_type, readAloud: row.read_aloud, shapeType: row.shape_type, shapeColor: row.shape_color, status: row.status, options: row.options } });
+  return res.json({ success: true, question: { id: row.id, ageGroupId: row.age_group_id, categoryId: row.category_id, levelId: row.level_id, learningLevelId: row.learning_level_id, text: row.question_text, explanation: row.explanation, mediaUrl: row.media_url, mediaType: row.media_type, readAloud: row.read_aloud, shapeType: row.shape_type, shapeColor: row.shape_color, status: row.status, isMagic: row.is_magic, magicRewardCoins: row.magic_reward_coins, options: row.options } });
 });
 
 router.put("/admin/questions/:id", verifyAdminToken, upload.fields(fields), async (req, res) => {
@@ -272,7 +278,7 @@ router.put("/admin/questions/:id", verifyAdminToken, upload.fields(fields), asyn
   let committed = false;
   try {
     await client.query("BEGIN");
-    const current = await client.query(`SELECT q.media_url,q.media_type,COALESCE(json_agg(json_build_object('order',o.option_order,'mediaUrl',o.media_url,'mediaType',o.media_type) ORDER BY o.option_order) FILTER (WHERE o.id IS NOT NULL),'[]') options FROM questions q LEFT JOIN question_options o ON o.question_id=q.id WHERE q.id=$1 GROUP BY q.id`, [req.params.id]);
+    const current = await client.query(`SELECT q.media_url,q.media_type,q.is_magic,q.magic_reward_coins,COALESCE(json_agg(json_build_object('order',o.option_order,'mediaUrl',o.media_url,'mediaType',o.media_type) ORDER BY o.option_order) FILTER (WHERE o.id IS NOT NULL),'[]') options FROM questions q LEFT JOIN question_options o ON o.question_id=q.id WHERE q.id=$1 GROUP BY q.id`, [req.params.id]);
     if (!current.rows[0]) { await client.query("ROLLBACK"); return res.status(404).json({ success: false, message: "Question not found." }); }
     const hierarchy = data.learningLevelId ? await client.query(`SELECT 1 FROM learning_items WHERE id=$1 AND item_type='level'`, [data.learningLevelId]) : await client.query(`SELECT 1 FROM game_levels l JOIN game_categories c ON c.id=l.category_id WHERE l.id=$1 AND c.id=$2 AND c.age_group_id=$3`, [data.levelId, data.categoryId, data.ageGroupId]);
     if (!hierarchy.rowCount) { await client.query("ROLLBACK"); return res.status(400).json({ success: false, message: "The selected age group, category, and level do not match." }); }
@@ -285,7 +291,10 @@ router.put("/admin/questions/:id", verifyAdminToken, upload.fields(fields), asyn
     const questionMediaType = questionFile || data.questionResourceUrl ? data.questionMediaType : removeMedia.has("question") ? null : current.rows[0].media_type;
     if (!plainText(questionText) && !questionMediaUrl && !data.shape) { await client.query("ROLLBACK"); await cleanupStored(cloudFiles); return res.status(400).json({ success: false, message: "Question text, media, or a shape is required." }); }
     if (data.options.filter((option) => option.isCorrect).length !== 1) { await client.query("ROLLBACK"); await cleanupStored(cloudFiles); return res.status(400).json({ success: false, message: "Exactly one option must be correct." }); }
-    await client.query(`UPDATE questions SET age_group_id=$1,category_id=$2,level_id=$3,learning_level_id=$4,question_text=$5,explanation=$6,media_url=$7,media_type=$8,status=$9,read_aloud=$10,shape_type=$11,shape_color=$12,updated_at=NOW() WHERE id=$13`, [data.ageGroupId||null,data.categoryId||null,data.levelId||null,data.learningLevelId||null,questionText,data.explanation,questionMediaUrl,questionMediaType,data.status,data.readAloud,data.shape?.type||null,data.shape?.color||null,req.params.id]);
+    const magicSettingsProvided = Object.prototype.hasOwnProperty.call(req.body, "isMagic") || Object.prototype.hasOwnProperty.call(req.body, "magicRewardCoins");
+    const isMagic = magicSettingsProvided ? data.isMagic : Boolean(current.rows[0].is_magic);
+    const magicRewardCoins = magicSettingsProvided ? data.magicRewardCoins : Number(current.rows[0].magic_reward_coins || 0);
+    await client.query(`UPDATE questions SET age_group_id=$1,category_id=$2,level_id=$3,learning_level_id=$4,question_text=$5,explanation=$6,media_url=$7,media_type=$8,status=$9,read_aloud=$10,shape_type=$11,shape_color=$12,is_magic=$13,magic_reward_coins=$14,updated_at=NOW() WHERE id=$15`, [data.ageGroupId||null,data.categoryId||null,data.levelId||null,data.learningLevelId||null,questionText,data.explanation,questionMediaUrl,questionMediaType,data.status,data.readAloud,data.shape?.type||null,data.shape?.color||null,isMagic,magicRewardCoins,req.params.id]);
     await client.query("UPDATE question_options SET is_correct=false WHERE question_id=$1", [req.params.id]);
     for (let index = 0; index < 4; index += 1) {
       const option = data.options[index]!; const file = fileMap[`optionMedia${index}`]?.[0]; const existing = current.rows[0].options[index] || {};
@@ -319,14 +328,14 @@ router.delete("/admin/questions/:id", verifyAdminToken, async (req, res) => {
 });
 
 router.get("/admin/levels/:levelId/questions", verifyAdminToken, async (req, res) => {
-  const result = await pool.query(`SELECT q.id,q.question_text,q.explanation,q.media_url,q.media_type,q.shape_type,q.shape_color,q.status,q.created_at,l.name level_name,l.level_number,l.points_per_question,l.time_limit_seconds,COALESCE(json_agg(json_build_object('id',o.id,'text',o.option_text,'mediaUrl',o.media_url,'mediaType',o.media_type,'isCorrect',o.is_correct,'shapeType',o.shape_type,'shapeColor',o.shape_color) ORDER BY o.option_order) FILTER (WHERE o.id IS NOT NULL),'[]') options FROM questions q JOIN game_levels l ON l.id=q.level_id LEFT JOIN question_options o ON o.question_id=q.id WHERE q.level_id=$1 GROUP BY q.id,l.name,l.level_number,l.points_per_question,l.time_limit_seconds ORDER BY q.created_at DESC`, [req.params.levelId]);
+  const result = await pool.query(`SELECT q.id,q.question_text,q.explanation,q.media_url,q.media_type,q.shape_type,q.shape_color,q.status,q.is_magic,q.magic_reward_coins,q.created_at,l.name level_name,l.level_number,l.points_per_question,l.time_limit_seconds,COALESCE(json_agg(json_build_object('id',o.id,'text',o.option_text,'mediaUrl',o.media_url,'mediaType',o.media_type,'isCorrect',o.is_correct,'shapeType',o.shape_type,'shapeColor',o.shape_color) ORDER BY o.option_order) FILTER (WHERE o.id IS NOT NULL),'[]') options FROM questions q JOIN game_levels l ON l.id=q.level_id LEFT JOIN question_options o ON o.question_id=q.id WHERE q.level_id=$1 GROUP BY q.id,l.name,l.level_number,l.points_per_question,l.time_limit_seconds ORDER BY q.created_at DESC`, [req.params.levelId]);
   const level = await pool.query("SELECT id,name,level_number,description,points_per_question,time_limit_seconds FROM game_levels WHERE id=$1", [req.params.levelId]);
   if (!level.rows[0]) return res.status(404).json({ success: false, message: "Level not found." });
-  return res.json({ success: true, level: level.rows[0], questions: result.rows.map((row: Record<string, unknown>) => ({ id: row.id, text: row.question_text, explanation: row.explanation, mediaUrl: row.media_url, mediaType: row.media_type, shapeType: row.shape_type, shapeColor: row.shape_color, status: row.status, createdAt: row.created_at, points: row.points_per_question, timeLimit: row.time_limit_seconds, options: row.options })) });
+  return res.json({ success: true, level: level.rows[0], questions: result.rows.map((row: Record<string, unknown>) => ({ id: row.id, text: row.question_text, explanation: row.explanation, mediaUrl: row.media_url, mediaType: row.media_type, shapeType: row.shape_type, shapeColor: row.shape_color, status: row.status, isMagic: row.is_magic, magicRewardCoins: row.magic_reward_coins, createdAt: row.created_at, points: row.points_per_question, timeLimit: row.time_limit_seconds, options: row.options })) });
 });
 
 router.get("/catalog/levels/:levelId/questions", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
-  const result = await pool.query(`WITH settings AS (SELECT id,points_per_question,time_limit_seconds,questions_per_play FROM game_levels WHERE id=$1 UNION ALL SELECT id,points_per_question,time_limit_seconds,questions_per_play FROM learning_items WHERE id=$1 AND item_type='level' LIMIT 1), selected AS (SELECT q.* FROM questions q,settings s WHERE (q.level_id=s.id OR q.learning_level_id=s.id) AND q.status='published' ORDER BY random() LIMIT (SELECT questions_per_play FROM settings)) SELECT q.id,q.question_text,q.explanation,q.media_url,q.media_type,q.read_aloud,q.shape_type,q.shape_color,s.points_per_question,s.time_limit_seconds,COALESCE(json_agg(json_build_object('id',o.id,'text',o.option_text,'mediaUrl',o.media_url,'mediaType',o.media_type,'isCorrect',o.is_correct,'shapeType',o.shape_type,'shapeColor',o.shape_color) ORDER BY o.option_order) FILTER (WHERE o.id IS NOT NULL),'[]') options FROM selected q CROSS JOIN settings s LEFT JOIN question_options o ON o.question_id=q.id GROUP BY q.id,q.question_text,q.explanation,q.media_url,q.media_type,q.read_aloud,q.shape_type,q.shape_color,s.points_per_question,s.time_limit_seconds ORDER BY random()`, [req.params.levelId]);
+  const result = await pool.query(`WITH settings AS (SELECT id,points_per_question,time_limit_seconds,questions_per_play FROM game_levels WHERE id=$1 UNION ALL SELECT id,points_per_question,time_limit_seconds,questions_per_play FROM learning_items WHERE id=$1 AND item_type='level' LIMIT 1), selected AS (SELECT q.* FROM questions q,settings s WHERE (q.level_id=s.id OR q.learning_level_id=s.id) AND q.status='published' ORDER BY random() LIMIT (SELECT questions_per_play FROM settings)) SELECT q.id,q.question_text,q.explanation,q.media_url,q.media_type,q.read_aloud,q.shape_type,q.shape_color,q.is_magic,q.magic_reward_coins,EXISTS(SELECT 1 FROM magic_question_claims mc WHERE mc.user_id=$2 AND mc.question_id=q.id) magic_reward_claimed,s.points_per_question,s.time_limit_seconds,COALESCE(json_agg(json_build_object('id',o.id,'text',o.option_text,'mediaUrl',o.media_url,'mediaType',o.media_type,'isCorrect',o.is_correct,'shapeType',o.shape_type,'shapeColor',o.shape_color) ORDER BY o.option_order) FILTER (WHERE o.id IS NOT NULL),'[]') options FROM selected q CROSS JOIN settings s LEFT JOIN question_options o ON o.question_id=q.id GROUP BY q.id,q.question_text,q.explanation,q.media_url,q.media_type,q.read_aloud,q.shape_type,q.shape_color,q.is_magic,q.magic_reward_coins,s.points_per_question,s.time_limit_seconds ORDER BY random()`, [req.params.levelId, req.user!.id]);
   if (!result.rowCount) return res.json({ success: true, questions: [] });
   const client = await pool.connect();
   try {
@@ -342,12 +351,12 @@ router.get("/catalog/levels/:levelId/questions", verifyPlayerToken, async (req: 
       const refill = await recordCoinTransaction({ userId: req.user!.id, type: "deduction", amount: Number(state.refill_coin_cost), description: `Automatic refill to ${state.max_lives} lives before starting a game`, reference: `life-refill:game-start:${randomUUID()}`, metadata: { levelId: req.params.levelId, kind: "game_start_refill" } }, client);
       await client.query("UPDATE users SET lives_remaining=$1,updated_at=NOW() WHERE id=$2", [state.max_lives, req.user!.id]);
       await client.query("COMMIT");
-      return res.json({ success: true, gameplay: { livesRemaining: Number(state.max_lives), maxLives: Number(state.max_lives), coinBalance: Number(refill.balance_after), refilled: true }, questions: result.rows.map((row: Record<string, any>) => ({ id: row.id, text: row.question_text, explanation: row.explanation, mediaUrl: row.media_url, mediaType: row.media_type, readAloud: row.read_aloud, shapeType: row.shape_type, shapeColor: row.shape_color, points: row.points_per_question, timeLimit: row.time_limit_seconds, options: row.options.map(({ isCorrect: _hidden, ...option }: Record<string, unknown>) => option) })) });
+      return res.json({ success: true, gameplay: { livesRemaining: Number(state.max_lives), maxLives: Number(state.max_lives), coinBalance: Number(refill.balance_after), refilled: true }, questions: result.rows.map((row: Record<string, any>) => ({ id: row.id, text: row.question_text, explanation: row.explanation, mediaUrl: row.media_url, mediaType: row.media_type, readAloud: row.read_aloud, shapeType: row.shape_type, shapeColor: row.shape_color, isMagic: row.is_magic, magicRewardCoins: row.magic_reward_coins, magicRewardClaimed: row.magic_reward_claimed, points: row.points_per_question, timeLimit: row.time_limit_seconds, options: row.options.map(({ isCorrect: _hidden, ...option }: Record<string, unknown>) => option) })) });
     }
     await client.query("COMMIT");
   } catch (error) { await client.query("ROLLBACK"); throw error; }
   finally { client.release(); }
-  res.json({ success: true, questions: result.rows.map((row: Record<string, any>) => ({ id: row.id, text: row.question_text, explanation: row.explanation, mediaUrl: row.media_url, mediaType: row.media_type, readAloud: row.read_aloud, shapeType: row.shape_type, shapeColor: row.shape_color, points: row.points_per_question, timeLimit: row.time_limit_seconds, options: row.options.map(({ isCorrect: _hidden, ...option }: Record<string, unknown>) => option) })) });
+  res.json({ success: true, questions: result.rows.map((row: Record<string, any>) => ({ id: row.id, text: row.question_text, explanation: row.explanation, mediaUrl: row.media_url, mediaType: row.media_type, readAloud: row.read_aloud, shapeType: row.shape_type, shapeColor: row.shape_color, isMagic: row.is_magic, magicRewardCoins: row.magic_reward_coins, magicRewardClaimed: row.magic_reward_claimed, points: row.points_per_question, timeLimit: row.time_limit_seconds, options: row.options.map(({ isCorrect: _hidden, ...option }: Record<string, unknown>) => option) })) });
 });
 
 export default router;
