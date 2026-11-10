@@ -1,6 +1,6 @@
 import { env } from "../config/env";
 
-export const SendOtp = async (email: string, otp: string): Promise<void> => {
+export const SendOtp = async (email: string, otp: string, purpose: "register" | "password_reset" = "register"): Promise<void> => {
   if (!env.ZOHO_MAIL_API_TOKEN || !env.ZOHO_MAIL_FROM) {
     throw new Error("ZeptoMail is not configured");
   }
@@ -22,7 +22,7 @@ export const SendOtp = async (email: string, otp: string): Promise<void> => {
       },
       signal: AbortSignal.timeout(env.MAIL_SEND_TIMEOUT_MS),
       body: JSON.stringify({
-        subject: " Secure One-Time Password (OTP) Verification",
+        subject: purpose === "password_reset" ? "Reset your Cedu password" : "Verify your Cedu account",
 
         from: {
           name: env.ZOHO_MAIL_FROM_NAME,
@@ -30,13 +30,13 @@ export const SendOtp = async (email: string, otp: string): Promise<void> => {
         },
         to: [{ email_address: { address: email, name: email } }],
         htmlbody: `
-          <div style="font-family: sans-serif; max-width: 500px; padding: 20px; background-color: #0a0a0a; color: #f5f5f5; border-radius: 12px; border: 1px solid #262626;">
-            <h2 style="color: #800080; margin-bottom: 4px;">Cedu</h2>
-            <p style="font-size: 14px; color: #a3a3a3;">Use the secure verification pin below to complete your authentication lifecycle initialization:</p>
-            <div style="background-color: #171717; padding: 16px; border-radius: 8px; text-align: center; margin: 24px 0; border: 1px solid #404040;">
-              <span style="font-size: 32px; font-weight: bold; letter-spacing: 6px; color: #ffffff;">${otp}</span>
+          <div style="font-family:Arial,sans-serif;max-width:520px;padding:28px;color:#243047;background:#fff;border:1px solid #e8e5ed;border-radius:14px">
+            <h2 style="color:#7442ae;margin:0 0 12px">Cedu</h2>
+            <p style="font-size:15px;line-height:1.6">${purpose === "password_reset" ? "Use this code to verify your identity and choose a new password." : "Use this code to verify your email address and finish creating your account."}</p>
+            <div style="background:#f7f4fb;padding:18px;text-align:center;margin:22px 0;border-radius:10px">
+              <span style="font-size:34px;font-weight:700;letter-spacing:8px;color:#56347f">${otp}</span>
             </div>
-            <p style="font-size: 11px; color: #525252; line-height: 1.4;">If you did not initiate this system access validation, please ignore this email sequence. This code expires strictly in 15 minutes.</p>
+            <p style="font-size:13px;color:#647084;line-height:1.5">This six-digit code expires in 15 minutes. If you did not request it, you can ignore this email.</p>
           </div>
         `,
       }),

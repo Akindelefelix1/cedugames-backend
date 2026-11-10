@@ -577,7 +577,7 @@ router.post("/user/register", sensitiveLimiter, async (req, res) => {
          ON CONFLICT(email,purpose) DO UPDATE SET otp_code=EXCLUDED.otp_code,expires_at=EXCLUDED.expires_at,is_used=false,failed_attempts=0,created_at=NOW()`,
         [email, hashOtp(email, "register", otp)],
       );
-      await SendOtp(email, otp);
+      await SendOtp(email, otp, "register");
     }
     await client.query("COMMIT");
     await logActivity({
@@ -653,12 +653,14 @@ async function issueOtp(emailValue: string, purpose: "register" | "password_rese
   if (!user.rows[0]) return;
   if (purpose === "register" && user.rows[0].is_verified) return;
   const otp = generateOtp();
-  await pool.query(
+  const saved = await pool.query(
     `INSERT INTO otps(email,otp_code,purpose,expires_at) VALUES($1,$2,$3,NOW()+INTERVAL '15 minutes')
-     ON CONFLICT(email,purpose) DO UPDATE SET otp_code=EXCLUDED.otp_code,expires_at=EXCLUDED.expires_at,is_used=false,failed_attempts=0,created_at=NOW()`,
+     ON CONFLICT(email,purpose) DO UPDATE SET otp_code=EXCLUDED.otp_code,expires_at=EXCLUDED.expires_at,is_used=false,failed_attempts=0,created_at=NOW()
+     WHERE otps.created_at <= NOW()-INTERVAL '60 seconds' RETURNING id`,
     [email, hashOtp(email, purpose, otp), purpose],
   );
-  await SendOtp(email, otp);
+  if (!saved.rowCount) return;
+  await SendOtp(email, otp, purpose);
 }
 
 router.post("/forgot-password", sensitiveLimiter, async (req, res) => {
@@ -674,7 +676,7 @@ router.post("/resend-otp", sensitiveLimiter, async (req, res) => {
   if (!validation.success) return res.status(400).json({ success: false, errors: validation.error.issues });
   try { await issueOtp(validation.data.email, validation.data.purpose); }
   catch (error) { console.error("OTP resend failed", error); }
-  return res.json({ success: true, message: "If the account exists, a new OTP has been sent." });
+  return res.json({ success: true, message: "If the account exists, a new code was sent or will be available shortly." });
 });
 
 router.post("/verify-otp", sensitiveLimiter, async (req, res) => {
@@ -715,17 +717,34 @@ router.post("/reset-password", sensitiveLimiter, async (req, res) => {
   if (!validation.success) return res.status(400).json({ success: false, errors: validation.error.issues });
   const token = req.headers.authorization?.startsWith("Bearer ") ? req.headers.authorization.slice(7) : "";
   if (!token) return res.status(401).json({ success: false, message: "Missing recovery session token." });
+  let decoded: { email: string; target: string; otpId: string };
+  try {
+    decoded = jwt.verify(token, env.JWT_SECRET, { issuer: "cedugames-api", audience: "cedugames-recovery" }) as typeof decoded;
+  } catch {
+    return res.status(403).json({ success: false, message: "Invalid or expired recovery token." });
+  }
+  if (decoded.target !== "recovery" || typeof decoded.email !== "string" || typeof decoded.otpId !== "string") {
+    return res.status(403).json({ success: false, message: "Invalid recovery token." });
+  }
   const client = await pool.connect();
   try {
-    const decoded = jwt.verify(token, env.JWT_SECRET, { issuer: "cedugames-api", audience: "cedugames-recovery" }) as { email: string; target: string; otpId: string };
-    if (decoded.target !== "recovery") return res.status(403).json({ success: false, message: "Invalid recovery token." });
     await client.query("BEGIN");
-    const consumed = await client.query("UPDATE otps SET is_used=true WHERE id=$1 AND email=$2 AND is_used=false AND expires_at>NOW() RETURNING id", [decoded.otpId, decoded.email]);
+    const consumed = await client.query("UPDATE otps SET is_used=true WHERE id=$1 AND email=$2 AND purpose='password_reset' AND is_used=false AND expires_at>NOW() RETURNING id", [decoded.otpId, decoded.email]);
     if (!consumed.rows[0]) { await client.query("ROLLBACK"); return res.status(403).json({ success: false, message: "Recovery token was already used or expired." }); }
-    await client.query("UPDATE users SET password=$1,token_version=token_version+1,updated_at=NOW() WHERE parent_user_id IS NULL AND lower(email)=$2", [await hashPassword(validation.data.newPassword), decoded.email]);
+    const account = await client.query("SELECT id,role FROM users WHERE parent_user_id IS NULL AND lower(email)=$1 FOR UPDATE", [decoded.email]);
+    if (!account.rows[0]) { await client.query("ROLLBACK"); return res.status(403).json({ success: false, message: "This account can no longer be recovered. Contact support." }); }
+    if (account.rows[0].role === "admin" && validation.data.newPassword.length < 10) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ success: false, message: "Admin passwords must contain at least 10 characters." });
+    }
+    await client.query("UPDATE users SET password=$1,token_version=token_version+1,updated_at=NOW() WHERE id=$2", [await hashPassword(validation.data.newPassword), account.rows[0].id]);
     await client.query("COMMIT");
     return res.json({ success: true, message: "Password reset successful. You can now log in." });
-  } catch { await client.query("ROLLBACK"); return res.status(403).json({ success: false, message: "Invalid or expired recovery token." }); }
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    console.error("Password reset failed", error);
+    return res.status(500).json({ success: false, message: "Password reset could not be completed. Please try again." });
+  }
   finally { client.release(); }
 });
 
