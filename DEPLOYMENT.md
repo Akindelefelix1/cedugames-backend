@@ -3,7 +3,7 @@
 ## Required external setup
 
 1. Provision PostgreSQL and set `DATABASE_URL`.
-2. In ZeptoMail, verify the sending domain, create an Agent, copy its Send Mail Token, and set `ZOHO_MAIL_API_TOKEN` and `ZOHO_MAIL_FROM`.
+2. In ZeptoMail, verify the sending domain, create an Agent, copy its Send Mail Token, and set `ZOHO_MAIL_API_TOKEN` and `ZOHO_MAIL_FROM`. Set `ZOHO_MAIL_API_URL` to the API endpoint shown for that same Agent's data center; the default `.com` endpoint will fail when the Agent belongs to another region.
 3. Create a Google OAuth web client and set `GOOGLE_CLIENT_ID`.
 4. Set `JWT_SECRET` to a unique secret of at least 32 characters. Never reuse the local value.
 5. Set `CORS_ORIGINS` to comma-separated frontend origins without trailing slashes. Include every deployed dashboard origin, including `https://cedugames-admin.onrender.com`, `https://cedugames-user.onrender.com`, `https://cedu-institute.onrender.com`, and `https://cedu.cephassuite.com` where those apps are hosted.

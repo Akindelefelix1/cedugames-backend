@@ -146,7 +146,14 @@ router.post("/forgot-password", sensitiveLimiter, async (req, res) => {
          WHERE otps.created_at <= NOW()-INTERVAL '60 seconds' RETURNING id`,
         [email, hashOtp(email, INSTITUTION_RESET_PURPOSE, otp), INSTITUTION_RESET_PURPOSE],
       );
-      if (saved.rowCount) await SendOtp(email, otp, "password_reset");
+      if (saved.rowCount) {
+        try {
+          await SendOtp(email, otp, "password_reset");
+        } catch (error) {
+          await pool.query("DELETE FROM otps WHERE id=$1", [saved.rows[0].id]).catch(() => undefined);
+          throw error;
+        }
+      }
     }
   } catch (error) { console.error("Institution password recovery request failed", error); }
   return res.json({ success: true, message: "If the account exists, a recovery code has been sent." });

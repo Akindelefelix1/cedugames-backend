@@ -660,7 +660,14 @@ async function issueOtp(emailValue: string, purpose: "register" | "password_rese
     [email, hashOtp(email, purpose, otp), purpose],
   );
   if (!saved.rowCount) return;
-  await SendOtp(email, otp, purpose);
+  try {
+    await SendOtp(email, otp, purpose);
+  } catch (error) {
+    // Do not leave a failed delivery under the 60-second cooldown; the user
+    // needs to be able to request another code as soon as the provider works.
+    await pool.query("DELETE FROM otps WHERE id=$1", [saved.rows[0].id]).catch(() => undefined);
+    throw error;
+  }
 }
 
 router.post("/forgot-password", sensitiveLimiter, async (req, res) => {

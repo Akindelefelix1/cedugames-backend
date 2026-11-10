@@ -17,7 +17,7 @@ export const SendOtp = async (email: string, otp: string, purpose: "register" | 
       method: "POST",
       headers: {
         accept: "application/json",
-        Authorization: `zoho-enczapikey ${sendMailToken}`,
+        Authorization: `Zoho-enczapikey ${sendMailToken}`,
         "content-type": "application/json",
       },
       signal: AbortSignal.timeout(env.MAIL_SEND_TIMEOUT_MS),
@@ -29,6 +29,7 @@ export const SendOtp = async (email: string, otp: string, purpose: "register" | 
           address: env.ZOHO_MAIL_FROM,
         },
         to: [{ email_address: { address: email, name: email } }],
+        textbody: `${purpose === "password_reset" ? "Use this code to verify your identity and choose a new password." : "Use this code to verify your email address and finish creating your account."} Your six-digit code is ${otp}. It expires in 15 minutes. If you did not request it, you can ignore this email.`,
         htmlbody: `
           <div style="font-family:Arial,sans-serif;max-width:520px;padding:28px;color:#243047;background:#fff;border:1px solid #e8e5ed;border-radius:14px">
             <h2 style="color:#7442ae;margin:0 0 12px">Cedu</h2>
@@ -42,32 +43,35 @@ export const SendOtp = async (email: string, otp: string, purpose: "register" | 
       }),
     });
 
-    const result = await response.json() as {
+    const responseText = await response.text();
+    let result: {
       message?: string;
       request_id?: string;
+      data?: { error_code?: string; message?: string; code?: string };
       error?: {
         code?: string;
         message?: string;
         request_id?: string;
         details?: Array<{ code?: string; message?: string; target?: string }>;
       };
-    };
+    } = {};
+    try { result = JSON.parse(responseText); } catch { /* Preserve the HTTP status when the provider returns a non-JSON error. */ }
 
-    if (!response.ok) {
+    if (!response.ok || result.message?.toLowerCase() === "error" || result.data?.error_code) {
       throw new Error(
         [
           `ZeptoMail HTTP ${response.status}`,
-          result.error?.code,
+          result.error?.code || result.data?.error_code,
           result.error?.details?.map((detail) =>
-            [detail.code, detail.message, detail.target].filter(Boolean).join(": "),
+            [detail.code, detail.message].filter(Boolean).join(": "),
           ).join(", "),
-          result.error?.message || result.message,
+          result.error?.message || result.data?.message || result.message,
           result.error?.request_id && `request ${result.error.request_id}`,
         ].filter(Boolean).join(" - "),
       );
     }
 
-    console.log(JSON.stringify({ level: "info", event: "otp_email_sent", requestId: result.request_id }));
+    console.log(JSON.stringify({ level: "info", event: "otp_email_accepted", requestId: result.request_id || null, providerMessage: result.message || null }));
   } catch (error: any) {
     console.error(JSON.stringify({ level: "error", event: "otp_email_failed", message: error.message }));
     throw error;
