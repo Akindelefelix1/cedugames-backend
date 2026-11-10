@@ -1,6 +1,6 @@
 import { env } from "../config/env";
 
-export const SendOtp = async (email: string, otp: string): Promise<void> => {
+export const SendOtp = async (email: string, otp: string, purpose: "register" | "password_reset" = "register"): Promise<void> => {
   if (!env.ZOHO_MAIL_API_TOKEN || !env.ZOHO_MAIL_FROM) {
     throw new Error("ZeptoMail is not configured");
   }
@@ -16,57 +16,61 @@ export const SendOtp = async (email: string, otp: string): Promise<void> => {
       method: "POST",
       headers: {
         accept: "application/json",
-        Authorization: `zoho-enczapikey ${sendMailToken}`,
+        Authorization: `Zoho-enczapikey ${sendMailToken}`,
         "content-type": "application/json",
       },
       signal: AbortSignal.timeout(env.MAIL_SEND_TIMEOUT_MS),
       body: JSON.stringify({
-        subject: " Secure One-Time Password (OTP) Verification",
+        subject: purpose === "password_reset" ? "Reset your Cedu password" : "Verify your Cedu account",
 
         from: {
           name: env.ZOHO_MAIL_FROM_NAME,
           address: env.ZOHO_MAIL_FROM,
         },
         to: [{ email_address: { address: email, name: email } }],
+        textbody: `${purpose === "password_reset" ? "Use this code to verify your identity and choose a new password." : "Use this code to verify your email address and finish creating your account."} Your six-digit code is ${otp}. It expires in 15 minutes. If you did not request it, you can ignore this email.`,
         htmlbody: `
-          <div style="font-family: sans-serif; max-width: 500px; padding: 20px; background-color: #0a0a0a; color: #f5f5f5; border-radius: 12px; border: 1px solid #262626;">
-            <h2 style="color: #800080; margin-bottom: 4px;">Cedu</h2>
-            <p style="font-size: 14px; color: #a3a3a3;">Use the secure verification pin below to complete your authentication lifecycle initialization:</p>
-            <div style="background-color: #171717; padding: 16px; border-radius: 8px; text-align: center; margin: 24px 0; border: 1px solid #404040;">
-              <span style="font-size: 32px; font-weight: bold; letter-spacing: 6px; color: #ffffff;">${otp}</span>
+          <div style="font-family:Arial,sans-serif;max-width:520px;padding:28px;color:#243047;background:#fff;border:1px solid #e8e5ed;border-radius:14px">
+            <h2 style="color:#7442ae;margin:0 0 12px">Cedu</h2>
+            <p style="font-size:15px;line-height:1.6">${purpose === "password_reset" ? "Use this code to verify your identity and choose a new password." : "Use this code to verify your email address and finish creating your account."}</p>
+            <div style="background:#f7f4fb;padding:18px;text-align:center;margin:22px 0;border-radius:10px">
+              <span style="font-size:34px;font-weight:700;letter-spacing:8px;color:#56347f">${otp}</span>
             </div>
-            <p style="font-size: 11px; color: #525252; line-height: 1.4;">If you did not initiate this system access validation, please ignore this email sequence. This code expires strictly in 15 minutes.</p>
+            <p style="font-size:13px;color:#647084;line-height:1.5">This six-digit code expires in 15 minutes. If you did not request it, you can ignore this email.</p>
           </div>
         `,
       }),
     });
 
-    const result = await response.json() as {
+    const responseText = await response.text();
+    let result: {
       message?: string;
       request_id?: string;
+      data?: { error_code?: string; message?: string; code?: string };
       error?: {
         code?: string;
         message?: string;
         request_id?: string;
         details?: Array<{ code?: string; message?: string; target?: string }>;
       };
-    };
+    } = {};
+    try { result = JSON.parse(responseText); } catch { /* Preserve the HTTP status when the provider returns a non-JSON error. */ }
 
-    if (!response.ok) {
+    if (!response.ok || result.message?.toLowerCase() === "error" || result.data?.error_code) {
       throw new Error(
         [
           `ZeptoMail HTTP ${response.status}`,
-          result.error?.code,
+          result.error?.code || result.data?.error_code,
           result.error?.details?.map((detail) =>
-            [detail.code, detail.message, detail.target].filter(Boolean).join(": "),
+            [detail.code, detail.message].filter(Boolean).join(": "),
           ).join(", "),
-          result.error?.message || result.message,
+          result.error?.message || result.data?.message || result.message,
           result.error?.request_id && `request ${result.error.request_id}`,
         ].filter(Boolean).join(" - "),
       );
     }
 
-    console.log(JSON.stringify({ level: "info", event: "otp_email_sent", requestId: result.request_id }));
+    console.log(JSON.stringify({ level: "info", event: "otp_email_accepted", requestId: result.request_id || null, providerMessage: result.message || null }));
   } catch (error: any) {
     console.error(JSON.stringify({ level: "error", event: "otp_email_failed", message: error.message }));
     throw error;

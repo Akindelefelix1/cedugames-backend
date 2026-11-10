@@ -378,7 +378,7 @@ router.post("/admin/account/password", verifyAdminToken, async (req: Authenticat
 
 router.get("/user/profile", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
   try {
-    const [userResult, performance, badges, attempts] = await Promise.all([
+    const [userResult, performance, badges] = await Promise.all([
       pool.query(`SELECT u.id,u.name,u.username,COALESCE(parent.email,u.email) email,u.age,u.profile_image_url,u.total_xp,u.coins_count,u.lives_remaining,u.is_verified,u.is_oauth,u.parent_user_id,u.created_at,u.updated_at FROM users u LEFT JOIN users parent ON parent.id=u.parent_user_id WHERE u.id=$1 AND u.role='user'`,[req.user!.id]),
       pool.query(`SELECT COUNT(a.id)::int attempts,COUNT(a.id) FILTER(WHERE a.passed)::int passed_attempts,
         COUNT(DISTINCT a.level_id) FILTER(WHERE a.passed)::int completed_levels,
@@ -389,18 +389,46 @@ router.get("/user/profile", verifyPlayerToken, async (req: AuthenticatedRequest,
         ub.earned_at,(ub.user_id IS NOT NULL) earned FROM badges b
         LEFT JOIN user_badges ub ON ub.badge_id=b.id AND ub.user_id=$1
         WHERE b.is_active=true ORDER BY b.sort_order,b.name`,[req.user!.id]),
-      pool.query(`SELECT a.id,a.score_percent,a.correct_answers,a.total_questions,a.passed,a.xp_awarded,a.created_at,
-        l.name level_name,l.level_number,c.name category_name,g.name age_group_name
-        FROM gameplay_attempts a JOIN game_levels l ON l.id=a.level_id
-        JOIN game_categories c ON c.id=l.category_id JOIN age_groups g ON g.id=c.age_group_id
-        WHERE a.user_id=$1 ORDER BY a.created_at DESC LIMIT 6`,[req.user!.id]),
     ]);
     if(!userResult.rows[0])return res.status(404).json({success:false,message:"Profile not found."});
-    return res.json({success:true,user:{...userResult.rows[0],performance:performance.rows[0]},badges:badges.rows,recentAttempts:attempts.rows});
+    return res.json({success:true,user:{...userResult.rows[0],performance:performance.rows[0]},badges:badges.rows});
   } catch(error) {
     console.error("Player profile failed",{userId:req.user!.id,error});
     return res.status(500).json({success:false,message:"Your profile could not be loaded."});
   }
+});
+
+router.get("/user/play-history", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
+  const type = String(req.query.type || "games");
+  if (type !== "games" && type !== "learn") return res.status(400).json({ success: false, message: "Choose CeduGames or CEDU-LEARN history." });
+  const requestedPage = Number.parseInt(String(req.query.page || "1"), 10);
+  const requestedLimit = Number.parseInt(String(req.query.limit || "10"), 10);
+  const page = Number.isFinite(requestedPage) && requestedPage > 0 ? requestedPage : 1;
+  const limit = Number.isFinite(requestedLimit) ? Math.min(25, Math.max(1, requestedLimit)) : 10;
+  const offset = (page - 1) * limit;
+  const [count, result] = type === "games" ? await Promise.all([
+    pool.query("SELECT COUNT(*)::int total FROM gameplay_attempts WHERE user_id=$1 AND level_id IS NOT NULL", [req.user!.id]),
+    pool.query(`SELECT a.id,a.score_percent,a.correct_answers,a.total_questions,a.passed,a.xp_awarded,a.created_at,
+      l.name level_name,l.level_number,c.name category_name,g.name age_group_name
+      FROM gameplay_attempts a JOIN game_levels l ON l.id=a.level_id
+      JOIN game_categories c ON c.id=l.category_id JOIN age_groups g ON g.id=c.age_group_id
+      WHERE a.user_id=$1 ORDER BY a.created_at DESC,a.id DESC LIMIT $2 OFFSET $3`, [req.user!.id, limit, offset]),
+  ]) : await Promise.all([
+    pool.query("SELECT COUNT(*)::int total FROM gameplay_attempts WHERE user_id=$1 AND learning_level_id IS NOT NULL", [req.user!.id]),
+    pool.query(`SELECT a.id,a.score_percent,a.correct_answers,a.total_questions,a.passed,a.xp_awarded,a.created_at,
+      level.title level_name,level.sort_order level_number,program.title program_name,
+      COALESCE(topic.title,subject.title,grade.title,section.title,'CEDU-LEARN') category_name,
+      CONCAT_WS(' / ',section.title,grade.title,subject.title,topic.title) learning_path
+      FROM gameplay_attempts a JOIN learning_items level ON level.id=a.learning_level_id AND level.item_type='level'
+      JOIN learning_programs program ON program.id=level.program_id
+      LEFT JOIN learning_items topic ON topic.id=level.parent_id
+      LEFT JOIN learning_items subject ON subject.id=topic.parent_id
+      LEFT JOIN learning_items grade ON grade.id=subject.parent_id
+      LEFT JOIN learning_items section ON section.id=grade.parent_id
+      WHERE a.user_id=$1 ORDER BY a.created_at DESC,a.id DESC LIMIT $2 OFFSET $3`, [req.user!.id, limit, offset]),
+  ]);
+  const total = Number(count.rows[0]?.total || 0);
+  return res.json({ success: true, type, history: result.rows, pagination: { page, limit, total, totalPages: Math.ceil(total / limit) } });
 });
 
 router.patch("/user/profile", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
@@ -577,7 +605,7 @@ router.post("/user/register", sensitiveLimiter, async (req, res) => {
          ON CONFLICT(email,purpose) DO UPDATE SET otp_code=EXCLUDED.otp_code,expires_at=EXCLUDED.expires_at,is_used=false,failed_attempts=0,created_at=NOW()`,
         [email, hashOtp(email, "register", otp)],
       );
-      await SendOtp(email, otp);
+      await SendOtp(email, otp, "register");
     }
     await client.query("COMMIT");
     await logActivity({
@@ -653,12 +681,21 @@ async function issueOtp(emailValue: string, purpose: "register" | "password_rese
   if (!user.rows[0]) return;
   if (purpose === "register" && user.rows[0].is_verified) return;
   const otp = generateOtp();
-  await pool.query(
+  const saved = await pool.query(
     `INSERT INTO otps(email,otp_code,purpose,expires_at) VALUES($1,$2,$3,NOW()+INTERVAL '15 minutes')
-     ON CONFLICT(email,purpose) DO UPDATE SET otp_code=EXCLUDED.otp_code,expires_at=EXCLUDED.expires_at,is_used=false,failed_attempts=0,created_at=NOW()`,
+     ON CONFLICT(email,purpose) DO UPDATE SET otp_code=EXCLUDED.otp_code,expires_at=EXCLUDED.expires_at,is_used=false,failed_attempts=0,created_at=NOW()
+     WHERE otps.created_at <= NOW()-INTERVAL '60 seconds' RETURNING id`,
     [email, hashOtp(email, purpose, otp), purpose],
   );
-  await SendOtp(email, otp);
+  if (!saved.rowCount) return;
+  try {
+    await SendOtp(email, otp, purpose);
+  } catch (error) {
+    // Do not leave a failed delivery under the 60-second cooldown; the user
+    // needs to be able to request another code as soon as the provider works.
+    await pool.query("DELETE FROM otps WHERE id=$1", [saved.rows[0].id]).catch(() => undefined);
+    throw error;
+  }
 }
 
 router.post("/forgot-password", sensitiveLimiter, async (req, res) => {
@@ -674,7 +711,7 @@ router.post("/resend-otp", sensitiveLimiter, async (req, res) => {
   if (!validation.success) return res.status(400).json({ success: false, errors: validation.error.issues });
   try { await issueOtp(validation.data.email, validation.data.purpose); }
   catch (error) { console.error("OTP resend failed", error); }
-  return res.json({ success: true, message: "If the account exists, a new OTP has been sent." });
+  return res.json({ success: true, message: "If the account exists, a new code was sent or will be available shortly." });
 });
 
 router.post("/verify-otp", sensitiveLimiter, async (req, res) => {
@@ -715,17 +752,34 @@ router.post("/reset-password", sensitiveLimiter, async (req, res) => {
   if (!validation.success) return res.status(400).json({ success: false, errors: validation.error.issues });
   const token = req.headers.authorization?.startsWith("Bearer ") ? req.headers.authorization.slice(7) : "";
   if (!token) return res.status(401).json({ success: false, message: "Missing recovery session token." });
+  let decoded: { email: string; target: string; otpId: string };
+  try {
+    decoded = jwt.verify(token, env.JWT_SECRET, { issuer: "cedugames-api", audience: "cedugames-recovery" }) as typeof decoded;
+  } catch {
+    return res.status(403).json({ success: false, message: "Invalid or expired recovery token." });
+  }
+  if (decoded.target !== "recovery" || typeof decoded.email !== "string" || typeof decoded.otpId !== "string") {
+    return res.status(403).json({ success: false, message: "Invalid recovery token." });
+  }
   const client = await pool.connect();
   try {
-    const decoded = jwt.verify(token, env.JWT_SECRET, { issuer: "cedugames-api", audience: "cedugames-recovery" }) as { email: string; target: string; otpId: string };
-    if (decoded.target !== "recovery") return res.status(403).json({ success: false, message: "Invalid recovery token." });
     await client.query("BEGIN");
-    const consumed = await client.query("UPDATE otps SET is_used=true WHERE id=$1 AND email=$2 AND is_used=false AND expires_at>NOW() RETURNING id", [decoded.otpId, decoded.email]);
+    const consumed = await client.query("UPDATE otps SET is_used=true WHERE id=$1 AND email=$2 AND purpose='password_reset' AND is_used=false AND expires_at>NOW() RETURNING id", [decoded.otpId, decoded.email]);
     if (!consumed.rows[0]) { await client.query("ROLLBACK"); return res.status(403).json({ success: false, message: "Recovery token was already used or expired." }); }
-    await client.query("UPDATE users SET password=$1,token_version=token_version+1,updated_at=NOW() WHERE parent_user_id IS NULL AND lower(email)=$2", [await hashPassword(validation.data.newPassword), decoded.email]);
+    const account = await client.query("SELECT id,role FROM users WHERE parent_user_id IS NULL AND lower(email)=$1 FOR UPDATE", [decoded.email]);
+    if (!account.rows[0]) { await client.query("ROLLBACK"); return res.status(403).json({ success: false, message: "This account can no longer be recovered. Contact support." }); }
+    if (account.rows[0].role === "admin" && validation.data.newPassword.length < 10) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ success: false, message: "Admin passwords must contain at least 10 characters." });
+    }
+    await client.query("UPDATE users SET password=$1,token_version=token_version+1,updated_at=NOW() WHERE id=$2", [await hashPassword(validation.data.newPassword), account.rows[0].id]);
     await client.query("COMMIT");
     return res.json({ success: true, message: "Password reset successful. You can now log in." });
-  } catch { await client.query("ROLLBACK"); return res.status(403).json({ success: false, message: "Invalid or expired recovery token." }); }
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    console.error("Password reset failed", error);
+    return res.status(500).json({ success: false, message: "Password reset could not be completed. Please try again." });
+  }
   finally { client.release(); }
 });
 

@@ -8,7 +8,8 @@ import pool from "../config/database_connection";
 import { env } from "../config/env";
 import { comparePassword, hashPassword } from "../helpers/hashPassword";
 import { destroyMediaQuietly, uploadMedia } from "../services/cloudinary_media_service";
-import { SendInstitutionStaffInvitation } from "../helpers/Mailer";
+import { SendInstitutionStaffInvitation, SendOtp } from "../helpers/Mailer";
+import { generateOtp, hashOtp } from "../helpers/otp";
 import { InstitutionLoginSchema, InstitutionRegisterSchema } from "../schemas/institution_auth_schema";
 import { verifyInstitutionToken, type InstitutionRequest } from "../middlewares/institution_authentication_middleware";
 
@@ -120,6 +121,95 @@ router.post("/staff-invitations/accept", sensitiveLimiter, async (req, res) => {
     console.error("Staff invitation acceptance failed", error);
     return res.status(500).json({ success: false, message: "The staff account could not be created." });
   }
+});
+
+const RecoveryEmailSchema = z.object({ email: z.string().trim().email().max(320) });
+const RecoveryCodeSchema = RecoveryEmailSchema.extend({ otp: z.string().regex(/^\d{6}$/) });
+const RecoveryPasswordSchema = z.object({ newPassword: z.string().min(8).max(128) });
+const INSTITUTION_RESET_PURPOSE = "institution_password_reset" as const;
+
+router.post("/forgot-password", sensitiveLimiter, async (req, res) => {
+  const input = RecoveryEmailSchema.safeParse(req.body);
+  if (!input.success) return res.status(400).json({ success: false, message: "Enter a valid email address." });
+  const email = normalizeEmail(input.data.email);
+  try {
+    const account = await pool.query(
+      `SELECT email FROM institutions WHERE lower(email)=$1 AND is_active=true
+       UNION ALL SELECT s.email FROM institution_staff s JOIN institutions i ON i.id=s.institution_id WHERE lower(s.email)=$1 AND s.status='active' AND i.is_active=true LIMIT 1`,
+      [email],
+    );
+    if (account.rows[0]) {
+      const otp = generateOtp();
+      const saved = await pool.query(
+        `INSERT INTO otps(email,otp_code,purpose,expires_at) VALUES($1,$2,$3,NOW()+INTERVAL '15 minutes')
+         ON CONFLICT(email,purpose) DO UPDATE SET otp_code=EXCLUDED.otp_code,expires_at=EXCLUDED.expires_at,is_used=false,failed_attempts=0,created_at=NOW()
+         WHERE otps.created_at <= NOW()-INTERVAL '60 seconds' RETURNING id`,
+        [email, hashOtp(email, INSTITUTION_RESET_PURPOSE, otp), INSTITUTION_RESET_PURPOSE],
+      );
+      if (saved.rowCount) {
+        try {
+          await SendOtp(email, otp, "password_reset");
+        } catch (error) {
+          await pool.query("DELETE FROM otps WHERE id=$1", [saved.rows[0].id]).catch(() => undefined);
+          throw error;
+        }
+      }
+    }
+  } catch (error) { console.error("Institution password recovery request failed", error); }
+  return res.json({ success: true, message: "If the account exists, a recovery code has been sent." });
+});
+
+router.post("/verify-reset-code", sensitiveLimiter, async (req, res) => {
+  const input = RecoveryCodeSchema.safeParse(req.body);
+  if (!input.success) return res.status(400).json({ success: false, message: "Enter a valid email address and six-digit code." });
+  const email = normalizeEmail(input.data.email), client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const otp = await client.query(
+      `SELECT id FROM otps WHERE email=$1 AND purpose=$2 AND otp_code=$3 AND is_used=false AND failed_attempts<5 AND expires_at>NOW() FOR UPDATE`,
+      [email, INSTITUTION_RESET_PURPOSE, hashOtp(email, INSTITUTION_RESET_PURPOSE, input.data.otp)],
+    );
+    if (!otp.rows[0]) {
+      await client.query("UPDATE otps SET failed_attempts=failed_attempts+1 WHERE email=$1 AND purpose=$2 AND is_used=false", [email, INSTITUTION_RESET_PURPOSE]);
+      await client.query("COMMIT");
+      return res.status(400).json({ success: false, message: "That code is invalid or expired. Request a new code and try again." });
+    }
+    const resetToken = jwt.sign({ email, target: "institution_recovery", otpId: otp.rows[0].id }, env.JWT_SECRET, {
+      expiresIn: "15m", issuer: "cedugames-api", audience: "cedugames-institution-recovery",
+    });
+    await client.query("COMMIT");
+    return res.json({ success: true, message: "Code verified. Choose a new password.", resetToken });
+  } catch (error) { await client.query("ROLLBACK"); throw error; }
+  finally { client.release(); }
+});
+
+router.post("/reset-password", sensitiveLimiter, async (req, res) => {
+  const input = RecoveryPasswordSchema.safeParse(req.body);
+  if (!input.success) return res.status(400).json({ success: false, message: "Your new password must contain 8 to 128 characters." });
+  const token = req.headers.authorization?.startsWith("Bearer ") ? req.headers.authorization.slice(7) : "";
+  if (!token) return res.status(401).json({ success: false, message: "Verify your recovery code before setting a new password." });
+  let decoded: { email: string; target: string; otpId: string };
+  try {
+    decoded = jwt.verify(token, env.JWT_SECRET, { issuer: "cedugames-api", audience: "cedugames-institution-recovery" }) as typeof decoded;
+  } catch { return res.status(403).json({ success: false, message: "Your recovery session expired. Request a new code." }); }
+  if (decoded.target !== "institution_recovery") return res.status(403).json({ success: false, message: "Invalid recovery session." });
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const consumed = await client.query("UPDATE otps SET is_used=true WHERE id=$1 AND email=$2 AND purpose=$3 AND is_used=false AND expires_at>NOW() RETURNING id", [decoded.otpId, decoded.email, INSTITUTION_RESET_PURPOSE]);
+    if (!consumed.rows[0]) { await client.query("ROLLBACK"); return res.status(403).json({ success: false, message: "This recovery session was already used or expired. Request a new code." }); }
+    const password = await hashPassword(input.data.newPassword);
+    const owner = await client.query("UPDATE institutions SET password=$1,token_version=token_version+1,updated_at=NOW() WHERE lower(email)=$2 AND is_active=true RETURNING id", [password, decoded.email]);
+    const staff = owner.rows[0] ? { rowCount: 1 } : await client.query(
+      `UPDATE institution_staff s SET password=$1,token_version=token_version+1,updated_at=NOW()
+       FROM institutions i WHERE s.institution_id=i.id AND lower(s.email)=$2 AND s.status='active' AND i.is_active=true RETURNING s.id`,
+      [password, decoded.email],
+    );
+    if (!owner.rows[0] && !staff.rowCount) { await client.query("ROLLBACK"); return res.status(403).json({ success: false, message: "This account can no longer be recovered." }); }
+    await client.query("COMMIT");
+    return res.json({ success: true, message: "Password reset successfully. Sign in with your new password." });
+  } catch (error) { await client.query("ROLLBACK"); throw error; }
+  finally { client.release(); }
 });
 
 router.patch("/profile", verifyInstitutionToken, async (req: InstitutionRequest, res) => {
