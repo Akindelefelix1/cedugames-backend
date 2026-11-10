@@ -378,7 +378,7 @@ router.post("/admin/account/password", verifyAdminToken, async (req: Authenticat
 
 router.get("/user/profile", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
   try {
-    const [userResult, performance, badges, attempts] = await Promise.all([
+    const [userResult, performance, badges] = await Promise.all([
       pool.query(`SELECT u.id,u.name,u.username,COALESCE(parent.email,u.email) email,u.age,u.profile_image_url,u.total_xp,u.coins_count,u.lives_remaining,u.is_verified,u.is_oauth,u.parent_user_id,u.created_at,u.updated_at FROM users u LEFT JOIN users parent ON parent.id=u.parent_user_id WHERE u.id=$1 AND u.role='user'`,[req.user!.id]),
       pool.query(`SELECT COUNT(a.id)::int attempts,COUNT(a.id) FILTER(WHERE a.passed)::int passed_attempts,
         COUNT(DISTINCT a.level_id) FILTER(WHERE a.passed)::int completed_levels,
@@ -389,18 +389,46 @@ router.get("/user/profile", verifyPlayerToken, async (req: AuthenticatedRequest,
         ub.earned_at,(ub.user_id IS NOT NULL) earned FROM badges b
         LEFT JOIN user_badges ub ON ub.badge_id=b.id AND ub.user_id=$1
         WHERE b.is_active=true ORDER BY b.sort_order,b.name`,[req.user!.id]),
-      pool.query(`SELECT a.id,a.score_percent,a.correct_answers,a.total_questions,a.passed,a.xp_awarded,a.created_at,
-        l.name level_name,l.level_number,c.name category_name,g.name age_group_name
-        FROM gameplay_attempts a JOIN game_levels l ON l.id=a.level_id
-        JOIN game_categories c ON c.id=l.category_id JOIN age_groups g ON g.id=c.age_group_id
-        WHERE a.user_id=$1 ORDER BY a.created_at DESC LIMIT 6`,[req.user!.id]),
     ]);
     if(!userResult.rows[0])return res.status(404).json({success:false,message:"Profile not found."});
-    return res.json({success:true,user:{...userResult.rows[0],performance:performance.rows[0]},badges:badges.rows,recentAttempts:attempts.rows});
+    return res.json({success:true,user:{...userResult.rows[0],performance:performance.rows[0]},badges:badges.rows});
   } catch(error) {
     console.error("Player profile failed",{userId:req.user!.id,error});
     return res.status(500).json({success:false,message:"Your profile could not be loaded."});
   }
+});
+
+router.get("/user/play-history", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
+  const type = String(req.query.type || "games");
+  if (type !== "games" && type !== "learn") return res.status(400).json({ success: false, message: "Choose CeduGames or CEDU-LEARN history." });
+  const requestedPage = Number.parseInt(String(req.query.page || "1"), 10);
+  const requestedLimit = Number.parseInt(String(req.query.limit || "10"), 10);
+  const page = Number.isFinite(requestedPage) && requestedPage > 0 ? requestedPage : 1;
+  const limit = Number.isFinite(requestedLimit) ? Math.min(25, Math.max(1, requestedLimit)) : 10;
+  const offset = (page - 1) * limit;
+  const [count, result] = type === "games" ? await Promise.all([
+    pool.query("SELECT COUNT(*)::int total FROM gameplay_attempts WHERE user_id=$1 AND level_id IS NOT NULL", [req.user!.id]),
+    pool.query(`SELECT a.id,a.score_percent,a.correct_answers,a.total_questions,a.passed,a.xp_awarded,a.created_at,
+      l.name level_name,l.level_number,c.name category_name,g.name age_group_name
+      FROM gameplay_attempts a JOIN game_levels l ON l.id=a.level_id
+      JOIN game_categories c ON c.id=l.category_id JOIN age_groups g ON g.id=c.age_group_id
+      WHERE a.user_id=$1 ORDER BY a.created_at DESC,a.id DESC LIMIT $2 OFFSET $3`, [req.user!.id, limit, offset]),
+  ]) : await Promise.all([
+    pool.query("SELECT COUNT(*)::int total FROM gameplay_attempts WHERE user_id=$1 AND learning_level_id IS NOT NULL", [req.user!.id]),
+    pool.query(`SELECT a.id,a.score_percent,a.correct_answers,a.total_questions,a.passed,a.xp_awarded,a.created_at,
+      level.title level_name,level.sort_order level_number,program.title program_name,
+      COALESCE(topic.title,subject.title,grade.title,section.title,'CEDU-LEARN') category_name,
+      CONCAT_WS(' / ',section.title,grade.title,subject.title,topic.title) learning_path
+      FROM gameplay_attempts a JOIN learning_items level ON level.id=a.learning_level_id AND level.item_type='level'
+      JOIN learning_programs program ON program.id=level.program_id
+      LEFT JOIN learning_items topic ON topic.id=level.parent_id
+      LEFT JOIN learning_items subject ON subject.id=topic.parent_id
+      LEFT JOIN learning_items grade ON grade.id=subject.parent_id
+      LEFT JOIN learning_items section ON section.id=grade.parent_id
+      WHERE a.user_id=$1 ORDER BY a.created_at DESC,a.id DESC LIMIT $2 OFFSET $3`, [req.user!.id, limit, offset]),
+  ]);
+  const total = Number(count.rows[0]?.total || 0);
+  return res.json({ success: true, type, history: result.rows, pagination: { page, limit, total, totalPages: Math.ceil(total / limit) } });
 });
 
 router.patch("/user/profile", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
