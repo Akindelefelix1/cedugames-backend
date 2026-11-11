@@ -11,6 +11,7 @@
     "start": "npm run migrate && node dist/server.js",
     "migrate": "node scripts/migrate.mjs",
     "migrate:down": "node scripts/migrate.mjs down",
+    "dispatch:push": "node dist/dispatch_push_notifications.js",
     "check": "npm run build && npm test"
   },
   "engines": {

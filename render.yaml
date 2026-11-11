@@ -16,6 +16,10 @@ services:
         sync: false
       - key: JWT_SECRET
         generateValue: true
+      - key: FCM_PROJECT_ID
+        sync: false
+      - key: FCM_SERVICE_ACCOUNT_JSON
+        sync: false
       # Add GOOGLE_CLIENT_ID in Render when Google authentication is enabled.
       - key: ZOHO_MAIL_API_URL
         value: https://api.zeptomail.com/v1.1/email

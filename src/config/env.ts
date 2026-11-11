@@ -7,6 +7,8 @@ const EnvSchema = z.object({
   DATABASE_URL: z.string().min(1, "DATABASE_URL is required"),
   JWT_SECRET: z.string().min(32, "JWT_SECRET must contain at least 32 characters"),
   GOOGLE_CLIENT_ID: z.string().default(""),
+  FCM_PROJECT_ID: z.string().default(""),
+  FCM_SERVICE_ACCOUNT_JSON: z.string().default(""),
   ZOHO_MAIL_API_URL: z.string().url().default("https://api.zeptomail.com/v1.1/email"),
   ZOHO_MAIL_API_TOKEN: z.string().default(""),
   ZOHO_MAIL_FROM: z.union([z.literal(""), z.string().email()]).default(""),
