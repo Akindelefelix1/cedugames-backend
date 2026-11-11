@@ -13,7 +13,7 @@ UPDATE notifications SET email_status='not_requested' WHERE email_status IS NULL
 
 ALTER TABLE notifications DROP CONSTRAINT IF EXISTS notifications_push_status_check;
 ALTER TABLE notifications ADD CONSTRAINT notifications_push_status_check
-  CHECK (push_status IN ('pending','processing','sent','failed','not_configured','not_requested'));
+  CHECK (push_status IN ('pending','processing','sent','failed','not_configured','not_requested','no_devices'));
 ALTER TABLE notifications ADD CONSTRAINT notifications_email_status_check
   CHECK (email_status IN ('pending','processing','sent','failed','not_configured','not_requested'));
 ALTER TABLE notifications ADD CONSTRAINT notifications_channels_check
@@ -23,6 +23,7 @@ ALTER TABLE notifications ADD CONSTRAINT notifications_channels_check
 ALTER TABLE notifications DROP CONSTRAINT IF EXISTS notifications_channels_check;
 ALTER TABLE notifications DROP CONSTRAINT IF EXISTS notifications_email_status_check;
 ALTER TABLE notifications DROP CONSTRAINT IF EXISTS notifications_push_status_check;
+UPDATE notifications SET push_status='sent' WHERE push_status IN ('not_requested','no_devices');
 ALTER TABLE notifications ADD CONSTRAINT notifications_push_status_check
   CHECK (push_status IN ('pending','processing','sent','failed','not_configured'));
 ALTER TABLE notifications DROP COLUMN IF EXISTS email_failure_count;

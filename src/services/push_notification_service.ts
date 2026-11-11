@@ -37,6 +37,10 @@ export async function deliverPushNotification(notificationId: string) {
        AND ($2='all' OR ($2='verified' AND root_user.is_verified=true) OR ($2='unverified' AND root_user.is_verified=false))`,
       [notification.target_user_ids || [], notification.audience],
     );
+    if (!tokens.rows.length) {
+      await pool.query("UPDATE notifications SET push_status='no_devices',push_started_at=NULL,push_sent_at=NULL,push_success_count=0,push_failure_count=0,push_error='No registered devices matched this audience.' WHERE id=$1", [notificationId]);
+      return;
+    }
     const accessToken = await (await googleAuth.getClient()).getAccessToken();
     let successCount = 0, failureCount = 0;
     const invalid: string[] = [];
