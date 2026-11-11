@@ -110,6 +110,7 @@ router.get("/admin/users", verifyAdminToken, async (_req, res) => {
     const [result, totals] = await Promise.all([
       pool.query(
         `SELECT u.id,u.name,u.username,u.email,u.age,u.profile_image_url,u.total_xp,u.coins_count,u.lives_remaining,u.is_verified,u.created_at,
+              (SELECT COUNT(*)::int FROM gameplay_attempts a WHERE a.user_id=u.id) attempts,
               COUNT(c.id)::int child_count,(u.coins_count+COALESCE(SUM(c.coins_count),0))::bigint household_coins_count
        FROM users u LEFT JOIN users c ON c.parent_user_id=u.id
        WHERE u.role='user' AND u.parent_user_id IS NULL
