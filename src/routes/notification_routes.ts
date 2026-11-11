@@ -4,13 +4,14 @@ import pool from "../config/database_connection";
 import { verifyAdminToken, verifyPlayerToken, type AuthenticatedRequest } from "../middlewares/authentication_middleware";
 import { activityRetentionOptions, defaultActivityRetentionDays, getActivityRetentionDays, logActivity, purgeExpiredActivityAndNotifications } from "../helpers/activityLog";
 import { deliverPushNotification } from "../services/push_notification_service";
+import { deliverEmailNotification } from "../services/email_notification_service";
 
 const router = Router();
 const uuid = z.string().uuid();
-const createSchema = z.object({ title: z.string().trim().min(3).max(160), message: z.string().trim().min(5).max(3000), type: z.enum(["announcement", "achievement", "reminder", "system"]).default("announcement"), audience: z.enum(["all", "verified", "unverified"]).default("all"), targetUserIds: z.array(z.string().uuid()).max(5000).default([]), scheduledAt: z.string().datetime({ offset: true }).nullable().optional() });
+const createSchema = z.object({ title: z.string().trim().min(3).max(160), message: z.string().trim().min(5).max(3000), type: z.enum(["announcement", "achievement", "reminder", "system"]).default("announcement"), audience: z.enum(["all", "verified", "unverified"]).default("all"), channels: z.array(z.enum(["in_app", "email", "push"])).min(1).max(3).refine(value => new Set(value).size === value.length, "Choose each delivery channel only once.").default(["in_app", "push"]), targetUserIds: z.array(z.string().uuid()).max(5000).default([]), scheduledAt: z.string().datetime({ offset: true }).nullable().optional() });
 const retentionSchema = z.object({ retentionDays: z.number().int().refine(value => activityRetentionOptions.includes(value as typeof activityRetentionOptions[number])) });
 const pageInfo = (q: any) => ({ page: Math.max(1, Number(q.page) || 1), limit: Math.min(50, Math.max(1, Number(q.limit) || 10)) });
-const audienceSql = `(n.audience='all' OR (n.audience='verified' AND u.is_verified=true) OR (n.audience='unverified' AND u.is_verified=false)) AND (cardinality(n.target_user_ids)=0 OR u.id=ANY(n.target_user_ids) OR u.parent_user_id=ANY(n.target_user_ids))`;
+const audienceSql = `('in_app'=ANY(n.channels)) AND (n.audience='all' OR (n.audience='verified' AND u.is_verified=true) OR (n.audience='unverified' AND u.is_verified=false)) AND (cardinality(n.target_user_ids)=0 OR u.id=ANY(n.target_user_ids) OR u.parent_user_id=ANY(n.target_user_ids))`;
 
 router.get("/admin/activity-retention", verifyAdminToken, async (req: AuthenticatedRequest, res) => {
   const retentionDays = await getActivityRetentionDays();
@@ -41,10 +42,16 @@ router.post("/admin/notifications", verifyAdminToken, async (req: AuthenticatedR
     const users = await pool.query("SELECT id FROM users WHERE role='user' AND parent_user_id IS NULL AND id=ANY($1::uuid[])", [targetUserIds]);
     if (users.rowCount !== targetUserIds.length) return res.status(400).json({ success: false, message: "One or more selected players are unavailable." });
   }
-  const result = await pool.query(`INSERT INTO notifications(title,message,type,audience,created_by,created_by_name,target_user_ids,scheduled_at,published_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,COALESCE($8,NOW())) RETURNING *`, [data.title, data.message, data.type, data.audience, actorId, actorName, targetUserIds, scheduledAt]);
-  await logActivity({ eventType: scheduledAt ? "notifications.scheduled" : "notifications.sent", title: scheduledAt ? "Player notification scheduled" : "Player notification sent", description: `${data.title} was ${scheduledAt ? "scheduled for " + scheduledAt.toISOString() : "sent"} to ${targetUserIds.length ? targetUserIds.length + " selected players" : data.audience + " players"}`, actorId, actorName, metadata: { notificationId: result.rows[0].id, audience: data.audience, targetUserIds, scheduledAt } });
-  if (!scheduledAt) void deliverPushNotification(result.rows[0].id).catch((error) => console.error("Push delivery failed", error));
-  return res.status(201).json({ success: true, message: scheduledAt ? "Notification scheduled." : "Notification published; push delivery has started.", notification: result.rows[0] });
+  const pushStatus = data.channels.includes("push") ? "pending" : "not_requested";
+  const emailStatus = data.channels.includes("email") ? "pending" : "not_requested";
+  const result = await pool.query(`INSERT INTO notifications(title,message,type,audience,created_by,created_by_name,target_user_ids,scheduled_at,published_at,channels,push_status,email_status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,COALESCE($8,NOW()),$9,$10,$11) RETURNING *`, [data.title, data.message, data.type, data.audience, actorId, actorName, targetUserIds, scheduledAt, data.channels, pushStatus, emailStatus]);
+  await logActivity({ eventType: scheduledAt ? "notifications.scheduled" : "notifications.sent", title: scheduledAt ? "Player notification scheduled" : "Player notification sent", description: `${data.title} was ${scheduledAt ? "scheduled for " + scheduledAt.toISOString() : "sent"} to ${targetUserIds.length ? targetUserIds.length + " selected players" : data.audience + " players"} via ${data.channels.join(", ")}`, actorId, actorName, metadata: { notificationId: result.rows[0].id, audience: data.audience, channels: data.channels, targetUserIds, scheduledAt } });
+  if (!scheduledAt) {
+    if (data.channels.includes("push")) void deliverPushNotification(result.rows[0].id).catch((error) => console.error("Push delivery failed", error));
+    if (data.channels.includes("email")) void deliverEmailNotification(result.rows[0].id).catch((error) => console.error("Email delivery failed", error));
+  }
+  const channelLabel = data.channels.map(channel => ({ in_app: "in-app", email: "email", push: "push" })[channel]).join(", ");
+  return res.status(201).json({ success: true, message: scheduledAt ? `Notification scheduled for ${channelLabel}.` : `Notification published; ${channelLabel} delivery has started.`, notification: result.rows[0] });
 });
 
 router.put("/notifications/device-token", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {

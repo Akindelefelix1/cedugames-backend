@@ -4,3 +4,5 @@ dist
 coverage
 *.log
 code.txt
+*firebase-adminsdk*.json
+*service-account*.json

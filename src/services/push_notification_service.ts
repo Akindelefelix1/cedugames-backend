@@ -1,6 +1,7 @@
 import { GoogleAuth } from "google-auth-library";
 import pool from "../config/database_connection";
 import { env } from "../config/env";
+import { deliverEmailNotification } from "./email_notification_service";
 
 let auth: GoogleAuth | null = null;
 function getAuth() {
@@ -18,7 +19,7 @@ export async function deliverPushNotification(notificationId: string) {
     await client.query("BEGIN");
     const locked = await client.query("SELECT * FROM notifications WHERE id=$1 FOR UPDATE", [notificationId]);
     const notification = locked.rows[0];
-    if (!notification || notification.push_status === "sent" || notification.push_status === "processing") { await client.query("COMMIT"); return; }
+    if (!notification || !notification.channels?.includes("push") || ["sent", "processing", "not_requested"].includes(notification.push_status)) { await client.query("COMMIT"); return; }
     const googleAuth = getAuth();
     if (!googleAuth) {
       await client.query("UPDATE notifications SET push_status='not_configured' WHERE id=$1", [notificationId]);
@@ -31,9 +32,9 @@ export async function deliverPushNotification(notificationId: string) {
     const tokens = await pool.query(
       `SELECT DISTINCT d.id,d.token FROM push_device_tokens d
        JOIN users device_user ON device_user.id=d.user_id
-       LEFT JOIN users player ON player.id=ANY($1::uuid[]) AND (player.id=device_user.id OR player.parent_user_id=device_user.id)
-       WHERE (cardinality($1::uuid[])=0 OR player.id IS NOT NULL)
-       AND ($2='all' OR ($2='verified' AND device_user.is_verified=true) OR ($2='unverified' AND device_user.is_verified=false))`,
+       JOIN users root_user ON root_user.id=COALESCE(device_user.parent_user_id,device_user.id)
+       WHERE (cardinality($1::uuid[])=0 OR root_user.id=ANY($1::uuid[]))
+       AND ($2='all' OR ($2='verified' AND root_user.is_verified=true) OR ($2='unverified' AND root_user.is_verified=false))`,
       [notification.target_user_ids || [], notification.audience],
     );
     const accessToken = await (await googleAuth.getClient()).getAccessToken();
@@ -67,9 +68,16 @@ export async function deliverPushNotification(notificationId: string) {
 
 export async function dispatchDuePushNotifications() {
   await pool.query("UPDATE notifications SET push_status='failed',push_started_at=NULL,push_error='Previous delivery timed out.' WHERE push_status='processing' AND push_started_at<NOW()-INTERVAL '5 minutes'");
-  const result = await pool.query("SELECT id FROM notifications WHERE push_status IN ('pending','failed','not_configured') AND COALESCE(scheduled_at,published_at)<=NOW() ORDER BY COALESCE(scheduled_at,published_at) LIMIT 20");
+  await pool.query("UPDATE notifications SET email_status='failed',email_started_at=NULL,email_error='Previous delivery timed out.' WHERE email_status='processing' AND email_started_at<NOW()-INTERVAL '5 minutes'");
+  const result = await pool.query("SELECT id,channels,push_status,email_status FROM notifications WHERE ((push_status IN ('pending','failed','not_configured') AND 'push'=ANY(channels)) OR (email_status IN ('pending','failed','not_configured') AND 'email'=ANY(channels))) AND COALESCE(scheduled_at,published_at)<=NOW() ORDER BY COALESCE(scheduled_at,published_at) LIMIT 20");
   for (const row of result.rows) {
-    try { await deliverPushNotification(row.id); }
-    catch (error) { console.error(JSON.stringify({ level: "error", event: "push_delivery_failed", notificationId: row.id, message: error instanceof Error ? error.message : "unknown" })); }
+    if (row.channels?.includes("push") && ["pending", "failed", "not_configured"].includes(row.push_status)) {
+      try { await deliverPushNotification(row.id); }
+      catch (error) { console.error(JSON.stringify({ level: "error", event: "push_delivery_failed", notificationId: row.id, message: error instanceof Error ? error.message : "unknown" })); }
+    }
+    if (row.channels?.includes("email") && ["pending", "failed", "not_configured"].includes(row.email_status)) {
+      try { await deliverEmailNotification(row.id); }
+      catch (error) { console.error(JSON.stringify({ level: "error", event: "email_delivery_failed", notificationId: row.id, message: error instanceof Error ? error.message : "unknown" })); }
+    }
   }
 }
