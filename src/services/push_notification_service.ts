@@ -44,6 +44,7 @@ export async function deliverPushNotification(notificationId: string) {
     const accessToken = await (await googleAuth.getClient()).getAccessToken();
     let successCount = 0, failureCount = 0;
     const invalid: string[] = [];
+    const failureDetails: string[] = [];
     for (let offset = 0; offset < tokens.rows.length; offset += 500) {
       const batch = tokens.rows.slice(offset, offset + 500);
       const results = await Promise.all(batch.map(async (device: { id: string; token: string }) => {
@@ -55,14 +56,23 @@ export async function deliverPushNotification(notificationId: string) {
           if (response.ok) return { ok: true };
           const detail = await response.json().catch(() => ({})) as any;
           if (detail?.error?.details?.some((item: any) => item.errorCode === "UNREGISTERED")) invalid.push(device.token);
+          const errorCode = detail?.error?.status || detail?.error?.details?.find((item: any) => item.errorCode)?.errorCode || `HTTP_${response.status}`;
+          const errorMessage = String(detail?.error?.message || "FCM rejected the device token.").slice(0, 240);
+          failureDetails.push(`${errorCode}: ${errorMessage}`);
           return { ok: false };
-        } catch { return { ok: false }; }
+        } catch (error) {
+          failureDetails.push(error instanceof Error ? error.message.slice(0, 240) : "FCM request failed.");
+          return { ok: false };
+        }
       }));
       successCount += results.filter((result) => result.ok).length;
       failureCount += results.filter((result) => !result.ok).length;
     }
     if (invalid.length) await pool.query("DELETE FROM push_device_tokens WHERE token=ANY($1::text[])", [invalid]);
-    await pool.query("UPDATE notifications SET push_status='sent',push_started_at=NULL,push_sent_at=NOW(),push_success_count=$2,push_failure_count=$3 WHERE id=$1", [notificationId, successCount, failureCount]);
+    const status = failureCount === 0 ? "sent" : successCount > 0 ? "partial" : "failed";
+    const errorSummary = [...new Set(failureDetails)].slice(0, 3).join("; ").slice(0, 1000) || null;
+    if (errorSummary) console.error(JSON.stringify({ level: "error", event: "push_delivery_rejected", notificationId, successCount, failureCount, details: errorSummary }));
+    await pool.query("UPDATE notifications SET push_status=$4,push_started_at=NULL,push_sent_at=NOW(),push_success_count=$2,push_failure_count=$3,push_error=$5 WHERE id=$1", [notificationId, successCount, failureCount, status, errorSummary]);
   } catch (error) {
     await client.query("ROLLBACK").catch(() => undefined);
     await pool.query("UPDATE notifications SET push_status='failed',push_started_at=NULL,push_error=$2 WHERE id=$1", [notificationId, error instanceof Error ? error.message.slice(0, 1000) : "Push delivery failed."]).catch(() => undefined);
@@ -73,9 +83,9 @@ export async function deliverPushNotification(notificationId: string) {
 export async function dispatchDuePushNotifications() {
   await pool.query("UPDATE notifications SET push_status='failed',push_started_at=NULL,push_error='Previous delivery timed out.' WHERE push_status='processing' AND push_started_at<NOW()-INTERVAL '5 minutes'");
   await pool.query("UPDATE notifications SET email_status='failed',email_started_at=NULL,email_error='Previous delivery timed out.' WHERE email_status='processing' AND email_started_at<NOW()-INTERVAL '5 minutes'");
-  const result = await pool.query("SELECT id,channels,push_status,email_status FROM notifications WHERE ((push_status IN ('pending','failed','not_configured') AND 'push'=ANY(channels)) OR (email_status IN ('pending','failed','not_configured') AND 'email'=ANY(channels))) AND COALESCE(scheduled_at,published_at)<=NOW() ORDER BY COALESCE(scheduled_at,published_at) LIMIT 20");
+  const result = await pool.query("SELECT id,channels,push_status,email_status FROM notifications WHERE ((push_status IN ('pending','not_configured') AND 'push'=ANY(channels)) OR (email_status IN ('pending','failed','not_configured') AND 'email'=ANY(channels))) AND COALESCE(scheduled_at,published_at)<=NOW() ORDER BY COALESCE(scheduled_at,published_at) LIMIT 20");
   for (const row of result.rows) {
-    if (row.channels?.includes("push") && ["pending", "failed", "not_configured"].includes(row.push_status)) {
+    if (row.channels?.includes("push") && ["pending", "not_configured"].includes(row.push_status)) {
       try { await deliverPushNotification(row.id); }
       catch (error) { console.error(JSON.stringify({ level: "error", event: "push_delivery_failed", notificationId: row.id, message: error instanceof Error ? error.message : "unknown" })); }
     }
