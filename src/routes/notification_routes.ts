@@ -11,7 +11,7 @@ const uuid = z.string().uuid();
 const createSchema = z.object({ title: z.string().trim().min(3).max(160), message: z.string().trim().min(5).max(3000), type: z.enum(["announcement", "achievement", "reminder", "system"]).default("announcement"), audience: z.enum(["all", "verified", "unverified"]).default("all"), channels: z.array(z.enum(["in_app", "email", "push"])).min(1).max(3).refine(value => new Set(value).size === value.length, "Choose each delivery channel only once.").default(["in_app", "push"]), targetUserIds: z.array(z.string().uuid()).max(5000).default([]), scheduledAt: z.string().datetime({ offset: true }).nullable().optional() });
 const retentionSchema = z.object({ retentionDays: z.number().int().refine(value => activityRetentionOptions.includes(value as typeof activityRetentionOptions[number])) });
 const pageInfo = (q: any) => ({ page: Math.max(1, Number(q.page) || 1), limit: Math.min(50, Math.max(1, Number(q.limit) || 10)) });
-const audienceSql = `('in_app'=ANY(n.channels)) AND (n.audience='all' OR (n.audience='verified' AND u.is_verified=true) OR (n.audience='unverified' AND u.is_verified=false)) AND (cardinality(n.target_user_ids)=0 OR u.id=ANY(n.target_user_ids) OR u.parent_user_id=ANY(n.target_user_ids))`;
+const audienceSql = `(('in_app'=ANY(n.channels) OR 'push'=ANY(n.channels))) AND (n.audience='all' OR (n.audience='verified' AND u.is_verified=true) OR (n.audience='unverified' AND u.is_verified=false)) AND (cardinality(n.target_user_ids)=0 OR u.id=ANY(n.target_user_ids) OR u.parent_user_id=ANY(n.target_user_ids))`;
 
 router.get("/admin/activity-retention", verifyAdminToken, async (req: AuthenticatedRequest, res) => {
   const retentionDays = await getActivityRetentionDays();

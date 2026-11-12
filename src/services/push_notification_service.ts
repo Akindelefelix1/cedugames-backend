@@ -51,7 +51,12 @@ export async function deliverPushNotification(notificationId: string) {
         try {
           const response = await fetch(`https://fcm.googleapis.com/v1/projects/${encodeURIComponent(env.FCM_PROJECT_ID)}/messages:send`, {
             method: "POST", headers: { Authorization: `Bearer ${accessToken.token}`, "Content-Type": "application/json" },
-            body: JSON.stringify({ message: { token: device.token, notification: { title: notification.title, body: notification.message }, data: { notificationId, type: notification.type } } }),
+            body: JSON.stringify({ message: {
+              token: device.token,
+              notification: { title: notification.title, body: notification.message },
+              android: { notification: { icon: "ic_notification", color: "#6336AA", channel_id: "cedu_updates" } },
+              data: { notificationId, type: notification.type },
+            } }),
           });
           if (response.ok) return { ok: true };
           const detail = await response.json().catch(() => ({})) as any;
