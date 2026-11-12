@@ -77,6 +77,33 @@ export const SendOtp = async (email: string, otp: string, purpose: "register" | 
   }
 };
 
+const escapeEmailHtml = (value: string) => value.replace(/[&<>"']/g, character => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[character]!));
+
+export const SendPlayerNotificationEmail = async (email: string, title: string, message: string): Promise<void> => {
+  if (!env.ZOHO_MAIL_API_TOKEN || !env.ZOHO_MAIL_FROM) throw new Error("Email delivery is not configured");
+  const sendMailToken = env.ZOHO_MAIL_API_TOKEN.trim().replace(/^zoho-enczapikey\s+/i, "").replace(/^['"]|['"]$/g, "");
+  const safeTitle = escapeEmailHtml(title);
+  const safeMessage = escapeEmailHtml(message).replace(/\r?\n/g, "<br>");
+  const response = await fetch(env.ZOHO_MAIL_API_URL, {
+    method: "POST",
+    headers: { accept: "application/json", Authorization: `Zoho-enczapikey ${sendMailToken}`, "content-type": "application/json" },
+    signal: AbortSignal.timeout(env.MAIL_SEND_TIMEOUT_MS),
+    body: JSON.stringify({
+      subject: title,
+      from: { name: env.ZOHO_MAIL_FROM_NAME, address: env.ZOHO_MAIL_FROM },
+      to: [{ email_address: { address: email, name: email } }],
+      textbody: `${title}\n\n${message}`,
+      htmlbody: `<div style="font-family:Arial,sans-serif;max-width:560px;padding:24px;color:#243047"><h2 style="color:#7442ae">${safeTitle}</h2><p style="font-size:15px;line-height:1.6">${safeMessage}</p><p style="font-size:12px;color:#718096">You received this message from Cedu.</p></div>`,
+    }),
+  });
+  const responseText = await response.text();
+  let result: { message?: string; data?: { error_code?: string; message?: string }; error?: { message?: string } } = {};
+  try { result = JSON.parse(responseText); } catch { /* Keep the provider status for non-JSON errors. */ }
+  if (!response.ok || result.message?.toLowerCase() === "error" || result.data?.error_code) {
+    throw new Error(result.error?.message || result.data?.message || result.message || `Notification email failed with HTTP ${response.status}`);
+  }
+};
+
 export const SendInstitutionInvitation = async (email: string, institutionName: string, inviteLink: string): Promise<void> => {
   if (!env.ZOHO_MAIL_API_TOKEN || !env.ZOHO_MAIL_FROM) throw new Error("Email delivery is not configured");
   const sendMailToken = env.ZOHO_MAIL_API_TOKEN.trim().replace(/^zoho-enczapikey\s+/i, "").replace(/^['"]|['"]$/g, "");
