@@ -12,7 +12,78 @@ const attemptSchema=z.object({attemptId:z.string().uuid(),levelId:z.string().uui
 const actionSchema=z.object({actionId:z.string().uuid(),eventKey:z.enum(["question_skipped","wrong_option_removed","answer_revealed"]),levelId:z.string().uuid(),questionId:z.string().uuid()});
 const popupAnswerSchema=z.object({campaignId:z.string().uuid(),questionId:z.string().uuid(),optionId:z.string().uuid()});
 router.get("/gameplay/popup-question",verifyPlayerToken,async(req:AuthenticatedRequest,res)=>{const r=await pool.query(`SELECT q.id,q.popup_campaign_id,q.question_text,q.explanation,q.media_url,q.media_type,q.shape_type,q.shape_color,q.popup_reward_coins,COALESCE(json_agg(json_build_object('id',o.id,'text',o.option_text,'mediaUrl',o.media_url,'mediaType',o.media_type,'shapeType',o.shape_type,'shapeColor',o.shape_color) ORDER BY o.option_order) FILTER(WHERE o.id IS NOT NULL),'[]') options FROM questions q JOIN users u ON u.id=$1 JOIN users account ON account.id=COALESCE(u.parent_user_id,u.id) LEFT JOIN question_options o ON o.question_id=q.id WHERE q.is_popup=true AND q.popup_active=true AND q.status='published' AND (q.popup_audience='all_users' OR account.created_at>=q.popup_activated_at) AND NOT EXISTS(SELECT 1 FROM popup_question_answers a WHERE a.user_id=u.id AND a.campaign_id=q.popup_campaign_id) GROUP BY q.id ORDER BY q.popup_activated_at ASC LIMIT 1`,[req.user!.id]);res.json({success:true,popupQuestion:r.rows[0]?{id:r.rows[0].id,campaignId:r.rows[0].popup_campaign_id,text:r.rows[0].question_text,explanation:r.rows[0].explanation,mediaUrl:r.rows[0].media_url,mediaType:r.rows[0].media_type,shapeType:r.rows[0].shape_type,shapeColor:r.rows[0].shape_color,rewardCoins:Number(r.rows[0].popup_reward_coins),options:r.rows[0].options}:null});});
-router.post("/gameplay/popup-question/answer",verifyPlayerToken,async(req:AuthenticatedRequest,res)=>{const parsed=popupAnswerSchema.safeParse(req.body);if(!parsed.success)return res.status(400).json({success:false,message:"Choose a valid answer."});const d=parsed.data,client=await pool.connect();try{await client.query("BEGIN");await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))",[`${req.user!.id}:${d.campaignId}`]);const prior=await client.query("SELECT question_id,selected_option_id,is_correct,reward_coins FROM popup_question_answers WHERE user_id=$1 AND campaign_id=$2",[req.user!.id,d.campaignId]);if(prior.rowCount){if(prior.rows[0].question_id!==d.questionId||prior.rows[0].selected_option_id!==d.optionId){await client.query("ROLLBACK");return res.status(409).json({success:false,message:"This question has already been answered."});}const details=await client.query(`SELECT q.explanation,o.id,o.option_text,o.media_url,o.media_type,o.shape_type,o.shape_color FROM questions q JOIN question_options o ON o.question_id=q.id WHERE q.id=$1 AND o.is_correct=true`,[d.questionId]);const balance=await client.query("SELECT coins_count FROM users WHERE id=$1",[req.user!.id]);await client.query("COMMIT");return res.json({success:true,isCorrect:prior.rows[0].is_correct,rewardCoins:Number(prior.rows[0].reward_coins),coinBalance:Number(balance.rows[0]?.coins_count||0),correctAnswer:details.rows[0]?{id:details.rows[0].id,text:details.rows[0].option_text,mediaUrl:details.rows[0].media_url,mediaType:details.rows[0].media_type,shapeType:details.rows[0].shape_type,shapeColor:details.rows[0].shape_color}:null,explanation:details.rows[0]?.explanation,alreadyAnswered:true});}const q=await client.query(`SELECT q.popup_reward_coins,q.question_text,q.explanation,o.id option_id,o.option_text,o.media_url,o.media_type,o.is_correct,o.shape_type,o.shape_color FROM questions q JOIN users u ON u.id=$2 JOIN users account ON account.id=COALESCE(u.parent_user_id,u.id) JOIN question_options o ON o.question_id=q.id WHERE q.id=$1 AND q.popup_campaign_id=$3 AND q.is_popup=true AND q.popup_active=true AND q.status='published' AND (q.popup_audience='all_users' OR account.created_at>=q.popup_activated_at) ORDER BY o.option_order FOR UPDATE OF q`,[d.questionId,req.user!.id,d.campaignId]);if(!q.rowCount||!q.rows.some((r:any)=>r.option_id===d.optionId)){await client.query("ROLLBACK");return res.status(409).json({success:false,message:"This promotional question is no longer available."});}const correct=q.rows.find((r:any)=>r.is_correct),selected=q.rows.find((r:any)=>r.option_id===d.optionId),isCorrect=Boolean(selected.is_correct),reward=isCorrect?Number(q.rows[0].popup_reward_coins):0;await client.query("INSERT INTO popup_question_answers(user_id,question_id,campaign_id,selected_option_id,is_correct,reward_coins) VALUES($1,$2,$3,$4,$5,$6)",[req.user!.id,d.questionId,d.campaignId,d.optionId,isCorrect,reward]);let balance;if(reward){const tx=await recordCoinTransaction({userId:req.user!.id,type:"reward",amount:reward,description:"Promotional question reward",reference:`popup-question:${d.campaignId}:user:${req.user!.id}`,metadata:{campaignId:d.campaignId,questionId:d.questionId}},client);balance=Number(tx.balance_after);}else{const b=await client.query("SELECT coins_count FROM users WHERE id=$1",[req.user!.id]);balance=Number(b.rows[0]?.coins_count||0);}await client.query("COMMIT");res.json({success:true,isCorrect,rewardCoins:reward,coinBalance:balance,correctAnswer:{id:correct.option_id,text:correct.option_text,mediaUrl:correct.media_url,mediaType:correct.media_type,shapeType:correct.shape_type,shapeColor:correct.shape_color},explanation:q.rows[0].explanation});}catch(e:any){await client.query("ROLLBACK");if(e.code==="23505")return res.status(409).json({success:false,message:"This question has already been answered."});throw e;}finally{client.release();}});
+router.post("/gameplay/popup-question/answer", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {
+  const parsed = popupAnswerSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ success: false, message: "Choose a valid answer." });
+  const data = parsed.data;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`${req.user!.id}:${data.campaignId}`]);
+    const prior = await client.query("SELECT question_id,selected_option_id,is_correct,reward_coins FROM popup_question_answers WHERE user_id=$1 AND campaign_id=$2", [req.user!.id, data.campaignId]);
+    if (prior.rowCount) {
+      if (prior.rows[0].question_id !== data.questionId || prior.rows[0].selected_option_id !== data.optionId) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ success: false, message: "This question has already been answered." });
+      }
+      const details = await client.query("SELECT q.explanation,o.id,o.option_text,o.media_url,o.media_type,o.shape_type,o.shape_color FROM questions q JOIN question_options o ON o.question_id=q.id WHERE q.id=$1 AND o.is_correct=true", [data.questionId]);
+      const balance = await client.query("SELECT coins_count FROM users WHERE id=$1", [req.user!.id]);
+      await client.query("COMMIT");
+      return res.json({ success: true, isCorrect: prior.rows[0].is_correct, rewardCoins: Number(prior.rows[0].reward_coins), coinBalance: Number(balance.rows[0]?.coins_count || 0), correctAnswer: details.rows[0] ? { id: details.rows[0].id, text: details.rows[0].option_text, mediaUrl: details.rows[0].media_url, mediaType: details.rows[0].media_type, shapeType: details.rows[0].shape_type, shapeColor: details.rows[0].shape_color } : null, explanation: details.rows[0]?.explanation, alreadyAnswered: true });
+    }
+
+    const answerOptions = await client.query(`SELECT q.popup_reward_coins,q.popup_max_participants,q.question_text,q.explanation,o.id option_id,o.option_text,o.media_url,o.media_type,o.is_correct,o.shape_type,o.shape_color
+      FROM questions q JOIN users u ON u.id=$2 JOIN users account ON account.id=COALESCE(u.parent_user_id,u.id) JOIN question_options o ON o.question_id=q.id
+      WHERE q.id=$1 AND q.popup_campaign_id=$3 AND q.is_popup=true AND q.popup_active=true AND q.status='published'
+        AND (q.popup_audience='all_users' OR account.created_at>=q.popup_activated_at)
+      ORDER BY o.option_order FOR UPDATE OF q`, [data.questionId, req.user!.id, data.campaignId]);
+    if (!answerOptions.rowCount || !answerOptions.rows.some((option: any) => option.option_id === data.optionId)) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ success: false, message: "This promotional question is no longer available." });
+    }
+
+    const participantLimit = answerOptions.rows[0].popup_max_participants === null ? null : Number(answerOptions.rows[0].popup_max_participants);
+    if (participantLimit !== null) {
+      const count = await client.query("SELECT COUNT(DISTINCT user_id)::int participants FROM popup_question_answers WHERE campaign_id=$1", [data.campaignId]);
+      if (Number(count.rows[0]?.participants || 0) >= participantLimit) {
+        await client.query("UPDATE questions SET popup_active=false,popup_campaign_id=NULL,popup_activated_at=NULL,updated_at=NOW() WHERE id=$1 AND popup_campaign_id=$2", [data.questionId, data.campaignId]);
+        await client.query("COMMIT");
+        return res.status(409).json({ success: false, code: "POPUP_CAMPAIGN_FULL", message: "This promotional question has reached its participant limit." });
+      }
+    }
+
+    const correct = answerOptions.rows.find((option: any) => option.is_correct);
+    const selected = answerOptions.rows.find((option: any) => option.option_id === data.optionId);
+    const isCorrect = Boolean(selected.is_correct);
+    const reward = isCorrect ? Number(answerOptions.rows[0].popup_reward_coins) : 0;
+    await client.query("INSERT INTO popup_question_answers(user_id,question_id,campaign_id,selected_option_id,is_correct,reward_coins) VALUES($1,$2,$3,$4,$5,$6)", [req.user!.id, data.questionId, data.campaignId, data.optionId, isCorrect, reward]);
+
+    let balance: number;
+    if (reward) {
+      const transaction = await recordCoinTransaction({ userId: req.user!.id, type: "reward", amount: reward, description: "Promotional question reward", reference: `popup-question:${data.campaignId}:user:${req.user!.id}`, metadata: { campaignId: data.campaignId, questionId: data.questionId } }, client);
+      balance = Number(transaction.balance_after);
+    } else {
+      const player = await client.query("SELECT coins_count FROM users WHERE id=$1", [req.user!.id]);
+      balance = Number(player.rows[0]?.coins_count || 0);
+    }
+
+    let campaignCompleted = false;
+    if (participantLimit !== null) {
+      const count = await client.query("SELECT COUNT(DISTINCT user_id)::int participants FROM popup_question_answers WHERE campaign_id=$1", [data.campaignId]);
+      campaignCompleted = Number(count.rows[0]?.participants || 0) >= participantLimit;
+      if (campaignCompleted) await client.query("UPDATE questions SET popup_active=false,popup_campaign_id=NULL,popup_activated_at=NULL,updated_at=NOW() WHERE id=$1 AND popup_campaign_id=$2", [data.questionId, data.campaignId]);
+    }
+
+    await client.query("COMMIT");
+    return res.json({ success: true, isCorrect, rewardCoins: reward, coinBalance: balance, campaignCompleted, correctAnswer: { id: correct.option_id, text: correct.option_text, mediaUrl: correct.media_url, mediaType: correct.media_type, shapeType: correct.shape_type, shapeColor: correct.shape_color }, explanation: answerOptions.rows[0].explanation });
+  } catch (error: any) {
+    await client.query("ROLLBACK");
+    if (error.code === "23505") return res.status(409).json({ success: false, message: "This question has already been answered." });
+    throw error;
+  } finally {
+    client.release();
+  }
+});
 const answerCheckSchema=z.object({levelId:z.string().uuid(),questionId:z.string().uuid(),optionId:z.string().uuid()});
 router.use(["/gameplay/refill","/gameplay/attempts"],verifyPlayerToken);
 router.use(["/gameplay/actions"],verifyPlayerToken);

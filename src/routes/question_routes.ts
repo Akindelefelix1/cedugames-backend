@@ -44,6 +44,7 @@ const bodySchema = z.object({
   magicRewardCoins: z.coerce.number().int().min(0).max(1000000).default(0),
   isPopup: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),
   popupRewardCoins: z.coerce.number().int().min(0).max(1000000).default(0),
+  popupMaxParticipants: z.preprocess((value) => value === "" || value === undefined || value === null ? null : Number(value), z.number().int().min(1).max(10000000).nullable()).default(null),
   popupAudience: z.enum(["new_users", "all_users"]).default("all_users"),
   popupActive: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),
   readAloud: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),
@@ -219,7 +220,7 @@ router.post("/admin/questions", verifyAdminToken, upload.fields(fields), async (
     await Promise.all(Object.keys(fileMap).map((field) => registerImageResource(storedMedia(cloudFiles, field), fileMap[field]?.[0], client)));
     const campaignId = data.popupActive ? randomUUID() : null;
     const activatedAt = data.popupActive ? new Date() : null;
-    const inserted = await client.query(`INSERT INTO questions(age_group_id,category_id,level_id,learning_level_id,question_text,explanation,media_url,media_type,status,read_aloud,shape_type,shape_color,is_magic,magic_reward_coins,is_popup,popup_reward_coins,popup_audience,popup_active,popup_campaign_id,popup_activated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) RETURNING *`, [data.ageGroupId||null, data.categoryId||null, data.levelId||null, data.learningLevelId||null, questionText, data.explanation, storedMedia(cloudFiles, "questionMedia")?.url || data.questionResourceUrl || null, questionFile || data.questionResourceUrl ? data.questionMediaType : null, data.status, data.readAloud, data.shape?.type || null, data.shape?.color || null, data.isMagic, data.magicRewardCoins, data.isPopup, data.isPopup ? data.popupRewardCoins : 0, data.popupAudience, data.popupActive, campaignId, activatedAt]);
+    const inserted = await client.query(`INSERT INTO questions(age_group_id,category_id,level_id,learning_level_id,question_text,explanation,media_url,media_type,status,read_aloud,shape_type,shape_color,is_magic,magic_reward_coins,is_popup,popup_reward_coins,popup_max_participants,popup_audience,popup_active,popup_campaign_id,popup_activated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21) RETURNING *`, [data.ageGroupId||null, data.categoryId||null, data.levelId||null, data.learningLevelId||null, questionText, data.explanation, storedMedia(cloudFiles, "questionMedia")?.url || data.questionResourceUrl || null, questionFile || data.questionResourceUrl ? data.questionMediaType : null, data.status, data.readAloud, data.shape?.type || null, data.shape?.color || null, data.isMagic, data.magicRewardCoins, data.isPopup, data.isPopup ? data.popupRewardCoins : 0, data.isPopup ? data.popupMaxParticipants : null, data.popupAudience, data.popupActive, campaignId, activatedAt]);
     for (let index = 0; index < data.options.length; index += 1) {
       const option = data.options[index]!; const file = fileMap[`optionMedia${index}`]?.[0];
       await client.query(`INSERT INTO question_options(question_id,option_order,option_text,media_url,media_type,is_correct,shape_type,shape_color) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, [inserted.rows[0].id, index, optionTexts[index], storedMedia(cloudFiles, `optionMedia${index}`)?.url || option.mediaUrl || null, file || option.mediaUrl ? option.mediaType : null, option.isCorrect, option.shape?.type || null, option.shape?.color || null]);
@@ -282,7 +283,7 @@ router.get("/admin/questions/:id", verifyAdminToken, async (req, res) => {
   const result = await pool.query(`SELECT q.*,COALESCE(json_agg(json_build_object('id',o.id,'text',o.option_text,'mediaUrl',o.media_url,'mediaType',o.media_type,'isCorrect',o.is_correct,'shapeType',o.shape_type,'shapeColor',o.shape_color) ORDER BY o.option_order) FILTER (WHERE o.id IS NOT NULL),'[]') options FROM questions q LEFT JOIN question_options o ON o.question_id=q.id WHERE q.id=$1 GROUP BY q.id`, [req.params.id]);
   const row = result.rows[0];
   if (!row) return res.status(404).json({ success: false, message: "Question not found." });
-  return res.json({ success: true, question: { id: row.id, ageGroupId: row.age_group_id, categoryId: row.category_id, levelId: row.level_id, learningLevelId: row.learning_level_id, text: row.question_text, explanation: row.explanation, mediaUrl: row.media_url, mediaType: row.media_type, readAloud: row.read_aloud, shapeType: row.shape_type, shapeColor: row.shape_color, status: row.status, isMagic: row.is_magic, magicRewardCoins: row.magic_reward_coins, isPopup: row.is_popup, popupRewardCoins: row.popup_reward_coins, popupAudience: row.popup_audience, popupActive: row.popup_active, options: row.options } });
+  return res.json({ success: true, question: { id: row.id, ageGroupId: row.age_group_id, categoryId: row.category_id, levelId: row.level_id, learningLevelId: row.learning_level_id, text: row.question_text, explanation: row.explanation, mediaUrl: row.media_url, mediaType: row.media_type, readAloud: row.read_aloud, shapeType: row.shape_type, shapeColor: row.shape_color, status: row.status, isMagic: row.is_magic, magicRewardCoins: row.magic_reward_coins, isPopup: row.is_popup, popupRewardCoins: row.popup_reward_coins, popupMaxParticipants: row.popup_max_participants, popupAudience: row.popup_audience, popupActive: row.popup_active, options: row.options } });
 });
 
 router.put("/admin/questions/:id", verifyAdminToken, upload.fields(fields), async (req, res) => {
@@ -300,7 +301,7 @@ router.put("/admin/questions/:id", verifyAdminToken, upload.fields(fields), asyn
   let committed = false;
   try {
     await client.query("BEGIN");
-    const current = await client.query(`SELECT q.media_url,q.media_type,q.is_magic,q.magic_reward_coins,q.is_popup,q.popup_reward_coins,q.popup_audience,q.popup_active,q.popup_campaign_id,q.popup_activated_at,COALESCE(json_agg(json_build_object('order',o.option_order,'mediaUrl',o.media_url,'mediaType',o.media_type) ORDER BY o.option_order) FILTER (WHERE o.id IS NOT NULL),'[]') options FROM questions q LEFT JOIN question_options o ON o.question_id=q.id WHERE q.id=$1 GROUP BY q.id`, [req.params.id]);
+    const current = await client.query(`SELECT q.media_url,q.media_type,q.is_magic,q.magic_reward_coins,q.is_popup,q.popup_reward_coins,q.popup_max_participants,q.popup_audience,q.popup_active,q.popup_campaign_id,q.popup_activated_at,COALESCE(json_agg(json_build_object('order',o.option_order,'mediaUrl',o.media_url,'mediaType',o.media_type) ORDER BY o.option_order) FILTER (WHERE o.id IS NOT NULL),'[]') options FROM questions q LEFT JOIN question_options o ON o.question_id=q.id WHERE q.id=$1 GROUP BY q.id`, [req.params.id]);
     if (!current.rows[0]) { await client.query("ROLLBACK"); return res.status(404).json({ success: false, message: "Question not found." }); }
     const hierarchy = data.learningLevelId ? await client.query(`SELECT 1 FROM learning_items WHERE id=$1 AND item_type='level'`, [data.learningLevelId]) : await client.query(`SELECT 1 FROM game_levels l JOIN game_categories c ON c.id=l.category_id WHERE l.id=$1 AND c.id=$2 AND c.age_group_id=$3`, [data.levelId, data.categoryId, data.ageGroupId]);
     if (!hierarchy.rowCount) { await client.query("ROLLBACK"); return res.status(400).json({ success: false, message: "The selected age group, category, and level do not match." }); }
@@ -316,16 +317,21 @@ router.put("/admin/questions/:id", verifyAdminToken, upload.fields(fields), asyn
     const magicSettingsProvided = Object.prototype.hasOwnProperty.call(req.body, "isMagic") || Object.prototype.hasOwnProperty.call(req.body, "magicRewardCoins");
     const isMagic = magicSettingsProvided ? data.isMagic : Boolean(current.rows[0].is_magic);
     const magicRewardCoins = magicSettingsProvided ? data.magicRewardCoins : Number(current.rows[0].magic_reward_coins || 0);
-    const popupSettingsProvided = ["isPopup", "popupRewardCoins", "popupAudience", "popupActive"].some((key) => Object.prototype.hasOwnProperty.call(req.body, key));
+    const popupSettingsProvided = ["isPopup", "popupRewardCoins", "popupMaxParticipants", "popupAudience", "popupActive"].some((key) => Object.prototype.hasOwnProperty.call(req.body, key));
     const isPopup = popupSettingsProvided ? data.isPopup : Boolean(current.rows[0].is_popup);
     const popupRewardCoins = isPopup ? (popupSettingsProvided ? data.popupRewardCoins : Number(current.rows[0].popup_reward_coins || 0)) : 0;
+    const popupMaxParticipants = isPopup ? (Object.prototype.hasOwnProperty.call(req.body, "popupMaxParticipants") ? data.popupMaxParticipants : current.rows[0].popup_max_participants) : null;
     const popupAudience = popupSettingsProvided ? data.popupAudience : current.rows[0].popup_audience;
     let popupActive = isPopup && data.status === "published" && (popupSettingsProvided ? data.popupActive : Boolean(current.rows[0].popup_active));
     if (popupActive && popupRewardCoins < 1) { await client.query("ROLLBACK"); return res.status(400).json({ success: false, message: "An active promotional question needs a coin reward." }); }
     const wasActive = Boolean(current.rows[0].popup_active);
-    const campaignId = popupActive ? (wasActive ? current.rows[0].popup_campaign_id : randomUUID()) : null;
+    let campaignId = popupActive ? (wasActive ? current.rows[0].popup_campaign_id : randomUUID()) : null;
     const activatedAt = popupActive ? (wasActive ? current.rows[0].popup_activated_at : new Date()) : null;
-    await client.query(`UPDATE questions SET age_group_id=$1,category_id=$2,level_id=$3,learning_level_id=$4,question_text=$5,explanation=$6,media_url=$7,media_type=$8,status=$9,read_aloud=$10,shape_type=$11,shape_color=$12,is_magic=$13,magic_reward_coins=$14,is_popup=$15,popup_reward_coins=$16,popup_audience=$17,popup_active=$18,popup_campaign_id=$19,popup_activated_at=$20,updated_at=NOW() WHERE id=$21`, [data.ageGroupId||null,data.categoryId||null,data.levelId||null,data.learningLevelId||null,questionText,data.explanation,questionMediaUrl,questionMediaType,data.status,data.readAloud,data.shape?.type||null,data.shape?.color||null,isMagic,magicRewardCoins,isPopup,popupRewardCoins,popupAudience,popupActive,campaignId,activatedAt,req.params.id]);
+    if (popupActive && popupMaxParticipants !== null) {
+      const participants = await client.query("SELECT COUNT(DISTINCT user_id)::int count FROM popup_question_answers WHERE campaign_id=$1", [campaignId]);
+      if (Number(participants.rows[0]?.count || 0) >= Number(popupMaxParticipants)) { popupActive = false; campaignId = null; }
+    }
+    await client.query(`UPDATE questions SET age_group_id=$1,category_id=$2,level_id=$3,learning_level_id=$4,question_text=$5,explanation=$6,media_url=$7,media_type=$8,status=$9,read_aloud=$10,shape_type=$11,shape_color=$12,is_magic=$13,magic_reward_coins=$14,is_popup=$15,popup_reward_coins=$16,popup_max_participants=$17,popup_audience=$18,popup_active=$19,popup_campaign_id=$20,popup_activated_at=$21,updated_at=NOW() WHERE id=$22`, [data.ageGroupId||null,data.categoryId||null,data.levelId||null,data.learningLevelId||null,questionText,data.explanation,questionMediaUrl,questionMediaType,data.status,data.readAloud,data.shape?.type||null,data.shape?.color||null,isMagic,magicRewardCoins,isPopup,popupRewardCoins,popupMaxParticipants,popupAudience,popupActive,campaignId,popupActive ? activatedAt : null,req.params.id]);
     await client.query("UPDATE question_options SET is_correct=false WHERE question_id=$1", [req.params.id]);
     for (let index = 0; index < 4; index += 1) {
       const option = data.options[index]!; const file = fileMap[`optionMedia${index}`]?.[0]; const existing = current.rows[0].options[index] || {};
