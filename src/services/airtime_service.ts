@@ -89,7 +89,9 @@ export async function redeemAirtime(input: { userId: string; phone: string; netw
   finally { client.release(); }
 
   try {
-    const provider = await providerPurchase({ network, amount: String(input.amount), phone, reference });
+    // Honour World's documented v2 payload is exactly network, amount, phone.
+    // The local reference remains our idempotency key and is not a provider field.
+    const provider = await providerPurchase({ network, amount: String(input.amount), phone });
     const providerReference = `${provider?.reference ?? provider?.data?.reference ?? provider?.transactionId ?? provider?.data?.transactionId ?? ""}` || null;
     const completed = await pool.query("UPDATE airtime_redemptions SET status='successful',provider_reference=$1,provider_response=$2,completed_at=NOW(),updated_at=NOW() WHERE id=$3 RETURNING *", [providerReference, provider, redemption.id]);
     return { redemption: completed.rows[0], repeated: false };
