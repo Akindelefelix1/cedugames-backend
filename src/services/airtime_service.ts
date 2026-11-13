@@ -33,7 +33,9 @@ async function providerPurchase(body: Record<string, unknown>) {
     throw Object.assign(new Error("Airtime provider is not configured."), { status: 503 });
   }
   const base = env.DATA_AND_AIRTIME_API_URL.replace(/\/+$/, "");
-  const url = /\/api\/v1$/i.test(base) ? `${base}/airtime/buy` : `${base}/api/v1/airtime/buy`;
+  // Keep an explicitly configured API version (for example /api/v2). Older
+  // behavior only recognized v1 and produced /api/v2/api/v1/... for v2 hosts.
+  const url = /\/api\/v\d+$/i.test(base) ? `${base}/airtime/buy` : `${base}/api/v1/airtime/buy`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 25_000);
   try {
@@ -47,6 +49,11 @@ async function providerPurchase(body: Record<string, unknown>) {
     return data;
   } catch (error: any) {
     if (error?.providerResponse || error?.status === 503) throw error;
+    console.error("Airtime provider request failed", {
+      providerHost: (() => { try { return new URL(url).host; } catch { return "invalid-url"; } })(),
+      errorName: error?.name || "Error",
+      errorCode: error?.cause?.code || error?.code || null,
+    });
     if (error?.name === "AbortError") throw Object.assign(new Error("The airtime provider timed out."), { status: 502 });
     throw Object.assign(new Error("The airtime provider is temporarily unavailable."), { status: 502 });
   } finally { clearTimeout(timer); }
