@@ -33,7 +33,9 @@ async function providerPurchase(body: Record<string, unknown>) {
     throw Object.assign(new Error("Airtime provider is not configured."), { status: 503 });
   }
   const base = env.DATA_AND_AIRTIME_API_URL.replace(/\/+$/, "");
-  const url = /\/api\/v1$/i.test(base) ? `${base}/airtime/buy` : `${base}/api/v1/airtime/buy`;
+  // Keep an explicitly configured API version (for example /api/v2). Older
+  // behavior only recognized v1 and produced /api/v2/api/v1/... for v2 hosts.
+  const url = /\/api\/v\d+$/i.test(base) ? `${base}/airtime/buy` : `${base}/api/v1/airtime/buy`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 25_000);
   try {
@@ -47,6 +49,11 @@ async function providerPurchase(body: Record<string, unknown>) {
     return data;
   } catch (error: any) {
     if (error?.providerResponse || error?.status === 503) throw error;
+    console.error("Airtime provider request failed", {
+      providerHost: (() => { try { return new URL(url).host; } catch { return "invalid-url"; } })(),
+      errorName: error?.name || "Error",
+      errorCode: error?.cause?.code || error?.code || null,
+    });
     if (error?.name === "AbortError") throw Object.assign(new Error("The airtime provider timed out."), { status: 502 });
     throw Object.assign(new Error("The airtime provider is temporarily unavailable."), { status: 502 });
   } finally { clearTimeout(timer); }
@@ -82,7 +89,9 @@ export async function redeemAirtime(input: { userId: string; phone: string; netw
   finally { client.release(); }
 
   try {
-    const provider = await providerPurchase({ network, amount: String(input.amount), phone, reference });
+    // Honour World's documented v2 payload is exactly network, amount, phone.
+    // The local reference remains our idempotency key and is not a provider field.
+    const provider = await providerPurchase({ network, amount: String(input.amount), phone });
     const providerReference = `${provider?.reference ?? provider?.data?.reference ?? provider?.transactionId ?? provider?.data?.transactionId ?? ""}` || null;
     const completed = await pool.query("UPDATE airtime_redemptions SET status='successful',provider_reference=$1,provider_response=$2,completed_at=NOW(),updated_at=NOW() WHERE id=$3 RETURNING *", [providerReference, provider, redemption.id]);
     return { redemption: completed.rows[0], repeated: false };
