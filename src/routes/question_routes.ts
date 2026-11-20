@@ -54,11 +54,12 @@ const bodySchema = z.object({
 }).refine((value) => Boolean(value.learningLevelId) || Boolean(value.ageGroupId && value.categoryId && value.levelId), { message: "Select a valid question placement." })
   .refine((value) => value.isMagic ? value.magicRewardCoins > 0 : value.magicRewardCoins === 0, { message: "Magic questions need a coin reward; regular questions must have no magic reward." })
   .refine((value) => value.isPopup ? value.popupRewardCoins > 0 && (!value.popupActive || value.status === "published") : value.popupRewardCoins === 0 && !value.popupActive, { message: "Promotional questions need a reward; active campaigns must be published." });
-const bulkHeaderNames = ["Questions", "Option A", "Option B", "Option C", "Option D", "Correct Answer"] as const;
+const bulkHeaderNames = ["Questions", "Option A", "Option B", "Option C", "Option D", "Correct Answer", "Answer Explanation"] as const;
 const bulkQuestionSchema = z.object({
   question: z.string().trim().min(1).max(500),
   options: z.array(z.string().trim().min(1).max(180)).length(4),
   correctAnswer: z.number().int().min(0).max(3),
+  explanation: z.string().trim().max(5000),
 });
 const storeFiles = async (fileMap: Record<string, Express.Multer.File[]>) => {
   const entries = await Promise.all(Object.entries(fileMap).map(async ([field, files]) => [field, await Promise.all(files.map((file) => uploadMedia(file)))] as const));
@@ -103,11 +104,11 @@ const parseBulkQuestions = (source: string) => {
   const errors: string[] = [];
   const questions = rows.slice(1).map((row, index) => {
     const line = index + 2;
-    if (row.length !== 6) { errors.push(`Row ${line} must contain exactly six columns.`); return null; }
+    if (row.length !== 7) { errors.push(`Row ${line} must contain exactly seven columns.`); return null; }
     const correct = row[5]!.trim().toLowerCase().replace(/\s+/g, " ");
     const correctIndex = ["option a", "option b", "option c", "option d"].indexOf(correct);
     if (correctIndex < 0) { errors.push(`Row ${line} has an invalid Correct Answer. Use Option A, Option B, Option C, or Option D.`); return null; }
-    const parsed = bulkQuestionSchema.safeParse({ question: row[0], options: row.slice(1, 5), correctAnswer: correctIndex });
+    const parsed = bulkQuestionSchema.safeParse({ question: row[0], options: row.slice(1, 5), correctAnswer: correctIndex, explanation: row[6] });
     if (!parsed.success) { errors.push(`Row ${line} has a missing or overly long question/option.`); return null; }
     return parsed.data;
   }).filter(Boolean) as Array<z.infer<typeof bulkQuestionSchema>>;
@@ -144,8 +145,8 @@ router.post("/admin/questions/bulk", verifyAdminToken, upload.single("file"), as
     for (const question of parsed.questions) {
       const inserted = await client.query(
         `INSERT INTO questions(age_group_id,category_id,level_id,learning_level_id,question_text,explanation,status,is_magic,magic_reward_coins)
-         VALUES($1,$2,$3,$4,$5,'',$6,$7,$8) RETURNING id`,
-        [placement.data.ageGroupId || null, placement.data.categoryId || null, placement.data.levelId || null, placement.data.learningLevelId || null, question.question, placement.data.status, placement.data.isMagic, placement.data.magicRewardCoins],
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+        [placement.data.ageGroupId || null, placement.data.categoryId || null, placement.data.levelId || null, placement.data.learningLevelId || null, question.question, question.explanation, placement.data.status, placement.data.isMagic, placement.data.magicRewardCoins],
       );
       for (let index = 0; index < question.options.length; index += 1) {
         await client.query(
