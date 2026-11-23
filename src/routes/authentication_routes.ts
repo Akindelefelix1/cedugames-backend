@@ -758,11 +758,16 @@ router.post("/google", sensitiveLimiter, async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
-async function issueOtp(emailValue: string, purpose: "register" | "password_reset"): Promise<"sent" | "throttled" | "unavailable"> {
+type OtpIssueResult =
+  | { status: "sent" }
+  | { status: "throttled"; retryAfterSeconds: number }
+  | { status: "unavailable" };
+
+async function issueOtp(emailValue: string, purpose: "register" | "password_reset"): Promise<OtpIssueResult> {
   const email = normalizeEmail(emailValue);
   const user = await pool.query("SELECT id,is_verified FROM users WHERE parent_user_id IS NULL AND lower(email)=$1", [email]);
-  if (!user.rows[0]) return "unavailable";
-  if (purpose === "register" && user.rows[0].is_verified) return "unavailable";
+  if (!user.rows[0]) return { status: "unavailable" };
+  if (purpose === "register" && user.rows[0].is_verified) return { status: "unavailable" };
   const otp = generateOtp();
   const saved = await pool.query(
     `INSERT INTO otps(email,otp_code,purpose,expires_at) VALUES($1,$2,$3,NOW()+INTERVAL '15 minutes')
@@ -770,7 +775,15 @@ async function issueOtp(emailValue: string, purpose: "register" | "password_rese
      WHERE otps.created_at <= NOW()-INTERVAL '60 seconds' RETURNING id`,
     [email, hashOtp(email, purpose, otp), purpose],
   );
-  if (!saved.rowCount) return "throttled";
+  if (!saved.rowCount) {
+    const cooldown = await pool.query(
+      `SELECT GREATEST(1,CEIL(EXTRACT(EPOCH FROM (created_at+INTERVAL '60 seconds'-NOW())))::int) retry_after_seconds
+       FROM otps WHERE email=$1 AND purpose=$2`,
+      [email, purpose],
+    );
+    if (cooldown.rows[0]) return { status: "throttled", retryAfterSeconds: Number(cooldown.rows[0].retry_after_seconds) };
+    return { status: "unavailable" };
+  }
   try {
     await SendOtp(email, otp, purpose);
   } catch (error) {
@@ -779,7 +792,7 @@ async function issueOtp(emailValue: string, purpose: "register" | "password_rese
     await pool.query("DELETE FROM otps WHERE id=$1", [saved.rows[0].id]).catch(() => undefined);
     throw error;
   }
-  return "sent";
+  return { status: "sent" };
 }
 
 router.post("/forgot-password", sensitiveLimiter, async (req, res) => {
@@ -804,11 +817,11 @@ router.post("/resend-otp", sensitiveLimiter, async (req, res) => {
     return res.json({ success: true, message: "If the account exists, a new code was sent or will be available shortly." });
   }
 
-  if (validation.data.purpose === "register" && result === "throttled") {
-    return res.status(429).json({ success: false, message: "A code was recently requested. Check your inbox and wait 60 seconds before trying again." });
+  if (validation.data.purpose === "register" && result.status === "throttled") {
+    return res.status(429).json({ success: false, retryAfterSeconds: result.retryAfterSeconds, message: "A code was recently requested. Check your inbox and wait before trying again." });
   }
-  if (validation.data.purpose === "register" && result === "sent") {
-    return res.json({ success: true, message: "A new verification code was sent. Check your inbox and spam folder." });
+  if (validation.data.purpose === "register" && result.status === "sent") {
+    return res.json({ success: true, resendAfterSeconds: 60, message: "A new verification code was sent. Check your inbox and spam folder." });
   }
   return res.json({ success: true, message: "If the account exists, a new code was sent or will be available shortly." });
 });
