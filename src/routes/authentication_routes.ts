@@ -806,7 +806,7 @@ router.post("/forgot-password", sensitiveLimiter, async (req, res) => {
 router.post("/resend-otp", sensitiveLimiter, async (req, res) => {
   const validation = ResendOtpSchema.safeParse(req.body);
   if (!validation.success) return res.status(400).json({ success: false, errors: validation.error.issues });
-  let result: "sent" | "throttled" | "unavailable";
+  let result: OtpIssueResult;
   try {
     result = await issueOtp(validation.data.email, validation.data.purpose);
   } catch (error) {
