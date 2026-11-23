@@ -53,6 +53,10 @@ const ResendOtpSchema = z.object({
   }),
 });
 
+const DeleteChildProfileSchema = z.object({
+  otp: z.string().regex(/^\d{6}$/, "Enter the six-digit code from your email."),
+});
+
 //reset-password zod schema
 const ResetPasswordSchema = z.object({
   newPassword: z.string().min(8).max(128),
@@ -77,6 +81,7 @@ export {
   ForgotPasswordSchema,
   VerifyOtpSchema,
   ResendOtpSchema,
+  DeleteChildProfileSchema,
   ResetPasswordSchema,
   UpdatePassword
   ,UpdateProfileSchema

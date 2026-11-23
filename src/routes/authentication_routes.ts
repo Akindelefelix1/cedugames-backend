@@ -13,7 +13,7 @@ import { getActivityRetentionDays, logActivity } from "../helpers/activityLog";
 import { verifyAdminToken, verifyPlayerToken, type AuthenticatedRequest } from "../middlewares/authentication_middleware";
 import {
   AdminLoginSchema, ForgotPasswordSchema, GoogleAuthSchema, UserLoginSchema, RegisterUserSchema,
-  ResendOtpSchema, ResetPasswordSchema, UpdatePassword, VerifyOtpSchema,
+  DeleteChildProfileSchema, ResendOtpSchema, ResetPasswordSchema, UpdatePassword, VerifyOtpSchema,
   UpdateProfileSchema,
 } from "../schemas/authentication_schema";
 import { z } from "zod";
@@ -501,6 +501,92 @@ router.patch("/user/profiles/:id", verifyPlayerToken, async (req: AuthenticatedR
   const result = await pool.query(`UPDATE users SET name=$1,age=$2,updated_at=NOW() WHERE id=$3 AND parent_user_id=$4 RETURNING id,name,username,age,profile_image_url,total_xp,coins_count,lives_remaining,parent_user_id,false is_primary`, [parsed.data.name, parsed.data.age, req.params.id, accountId]);
   if (!result.rows[0]) return res.status(404).json({ success: false, message: "Child profile not found." });
   return res.json({ success: true, message: "Child profile updated.", profile: result.rows[0] });
+});
+
+router.post("/user/profiles/:id/delete-otp", verifyPlayerToken, sensitiveLimiter, async (req: AuthenticatedRequest, res) => {
+  const childId = String(req.params.id || "");
+  if (!z.string().uuid().safeParse(childId).success) return res.status(400).json({ success: false, message: "Invalid child profile." });
+  const accountId = req.user!.accountId || req.user!.id;
+
+  try {
+    const result = await pool.query(
+      `SELECT parent.email FROM users child
+       JOIN users parent ON parent.id=child.parent_user_id
+       WHERE child.id=$1 AND child.parent_user_id=$2 AND parent.role='user' AND parent.is_verified=true`,
+      [childId, accountId],
+    );
+    const email = result.rows[0]?.email;
+    if (!email) return res.status(404).json({ success: false, message: "Child profile not found." });
+
+    const otp = generateOtp();
+    const purpose = "child_delete";
+    const saved = await pool.query(
+      `INSERT INTO otps(email,otp_code,purpose,expires_at)
+       VALUES($1,$2,$3,NOW()+INTERVAL '15 minutes')
+       ON CONFLICT(email,purpose) DO UPDATE SET otp_code=EXCLUDED.otp_code,expires_at=EXCLUDED.expires_at,
+         is_used=false,failed_attempts=0,created_at=NOW()
+       WHERE otps.created_at <= NOW()-INTERVAL '60 seconds' RETURNING id`,
+      [email, hashOtp(email, `${purpose}:${childId}`, otp), purpose],
+    );
+    if (!saved.rowCount) return res.status(429).json({ success: false, message: "Wait 60 seconds before requesting another deletion code." });
+
+    try {
+      await SendOtp(email, otp, purpose);
+    } catch (error) {
+      await pool.query("DELETE FROM otps WHERE id=$1", [saved.rows[0].id]).catch(() => undefined);
+      throw error;
+    }
+
+    return res.json({ success: true, message: "A deletion code was sent to the email on your account." });
+  } catch (error) {
+    console.error("Child deletion code could not be sent", { childId, error });
+    return res.status(503).json({ success: false, message: "The deletion code could not be sent. Please try again shortly." });
+  }
+});
+
+router.delete("/user/profiles/:id", verifyPlayerToken, sensitiveLimiter, async (req: AuthenticatedRequest, res) => {
+  const childId = String(req.params.id || "");
+  if (!z.string().uuid().safeParse(childId).success) return res.status(400).json({ success: false, message: "Invalid child profile." });
+  const validation = DeleteChildProfileSchema.safeParse(req.body);
+  if (!validation.success) return res.status(400).json({ success: false, message: validation.error.issues[0]?.message || "Enter the six-digit code from your email." });
+  const accountId = req.user!.accountId || req.user!.id;
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+    const account = await client.query("SELECT name,email FROM users WHERE id=$1 AND parent_user_id IS NULL AND role='user' AND is_verified=true FOR UPDATE", [accountId]);
+    const child = await client.query("SELECT id,name FROM users WHERE id=$1 AND parent_user_id=$2 AND role='user' FOR UPDATE", [childId, accountId]);
+    if (!account.rows[0] || !child.rows[0]) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, message: "Child profile not found." });
+    }
+
+    const email = normalizeEmail(account.rows[0].email);
+    const purpose = "child_delete";
+    const otp = hashOtp(email, `${purpose}:${childId}`, validation.data.otp);
+    const saved = await client.query(
+      `SELECT id FROM otps WHERE email=$1 AND purpose=$2 AND otp_code=$3 AND is_used=false
+       AND failed_attempts<5 AND expires_at>NOW() FOR UPDATE`,
+      [email, purpose, otp],
+    );
+    if (!saved.rows[0]) {
+      await client.query("UPDATE otps SET failed_attempts=failed_attempts+1 WHERE email=$1 AND purpose=$2 AND is_used=false", [email, purpose]);
+      await client.query("COMMIT");
+      return res.status(400).json({ success: false, message: "Invalid or expired deletion code." });
+    }
+
+    await client.query("UPDATE otps SET is_used=true WHERE id=$1", [saved.rows[0].id]);
+    await client.query("DELETE FROM users WHERE id=$1 AND parent_user_id=$2", [childId, accountId]);
+    await client.query("COMMIT");
+    await logActivity({ eventType: "profile.child_deleted", title: "Child profile deleted", description: `${account.rows[0].name} deleted ${child.rows[0].name}'s profile`, actorId: accountId, actorName: account.rows[0].name, metadata: { profileId: childId } });
+    return res.json({ success: true, message: `${child.rows[0].name}'s profile and learning data were deleted.` });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("Child profile deletion failed", { childId, error });
+    return res.status(500).json({ success: false, message: "The child profile could not be deleted." });
+  } finally {
+    client.release();
+  }
 });
 
 router.get("/user/dashboard-bootstrap", verifyPlayerToken, async (req: AuthenticatedRequest, res) => {

@@ -1,6 +1,6 @@
 import { env } from "../config/env";
 
-export const SendOtp = async (email: string, otp: string, purpose: "register" | "password_reset" = "register"): Promise<void> => {
+export const SendOtp = async (email: string, otp: string, purpose: "register" | "password_reset" | "child_delete" = "register"): Promise<void> => {
   if (!env.ZOHO_MAIL_API_TOKEN || !env.ZOHO_MAIL_FROM) {
     throw new Error("ZeptoMail is not configured");
   }
@@ -12,6 +12,12 @@ export const SendOtp = async (email: string, otp: string, purpose: "register" | 
       .replace(/^zoho-enczapikey\s+/i, "")
       .replace(/^['"]|['"]$/g, "");
 
+    const purposeCopy = purpose === "password_reset"
+      ? { subject: "Reset your Cedu password", instruction: "Use this code to verify your identity and choose a new password." }
+      : purpose === "child_delete"
+        ? { subject: "Confirm child profile deletion", instruction: "Use this code to confirm deletion of a child profile from your Cedu family account." }
+        : { subject: "Verify your Cedu account", instruction: "Use this code to verify your email address and finish creating your account." };
+
     const response = await fetch(env.ZOHO_MAIL_API_URL, {
       method: "POST",
       headers: {
@@ -21,18 +27,18 @@ export const SendOtp = async (email: string, otp: string, purpose: "register" | 
       },
       signal: AbortSignal.timeout(env.MAIL_SEND_TIMEOUT_MS),
       body: JSON.stringify({
-        subject: purpose === "password_reset" ? "Reset your Cedu password" : "Verify your Cedu account",
+        subject: purposeCopy.subject,
 
         from: {
           name: env.ZOHO_MAIL_FROM_NAME,
           address: env.ZOHO_MAIL_FROM,
         },
         to: [{ email_address: { address: email, name: email } }],
-        textbody: `${purpose === "password_reset" ? "Use this code to verify your identity and choose a new password." : "Use this code to verify your email address and finish creating your account."} Your six-digit code is ${otp}. It expires in 15 minutes. If you did not request it, you can ignore this email.`,
+        textbody: `${purposeCopy.instruction} Your six-digit code is ${otp}. It expires in 15 minutes. If you did not request it, you can ignore this email.`,
         htmlbody: `
           <div style="font-family:Arial,sans-serif;max-width:520px;padding:28px;color:#243047;background:#fff;border:1px solid #e8e5ed;border-radius:14px">
             <h2 style="color:#7442ae;margin:0 0 12px">Cedu</h2>
-            <p style="font-size:15px;line-height:1.6">${purpose === "password_reset" ? "Use this code to verify your identity and choose a new password." : "Use this code to verify your email address and finish creating your account."}</p>
+            <p style="font-size:15px;line-height:1.6">${purposeCopy.instruction}</p>
             <div style="background:#f7f4fb;padding:18px;text-align:center;margin:22px 0;border-radius:10px">
               <span style="font-size:34px;font-weight:700;letter-spacing:8px;color:#56347f">${otp}</span>
             </div>
