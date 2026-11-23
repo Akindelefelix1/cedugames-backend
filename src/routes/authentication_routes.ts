@@ -481,8 +481,8 @@ router.post("/user/profiles", verifyPlayerToken, async (req: AuthenticatedReques
     const count = await client.query("SELECT COUNT(*)::int total FROM users WHERE parent_user_id=$1", [accountId]);
     if (Number(count.rows[0].total) >= 10) { await client.query("ROLLBACK"); return res.status(409).json({ success: false, message: "An account can have up to 10 child profiles." }); }
     const result = await client.query(
-      `INSERT INTO users(id,name,username,email,age,role,is_verified,parent_user_id,password)
-       VALUES($1,$2,$3,$4,$5,'user',true,$6,NULL)
+      `INSERT INTO users(id,name,username,email,age,role,is_verified,parent_user_id,password,coins_count)
+       VALUES($1,$2,$3,$4,$5,'user',true,$6,NULL,0)
        RETURNING id,name,username,age,profile_image_url,total_xp,coins_count,lives_remaining,parent_user_id,false is_primary`,
       [id, parsed.data.name, `${slug}_${id.slice(0, 8)}`, `child.${id}@profiles.cedugames.local`, parsed.data.age, accountId],
     );
@@ -595,19 +595,17 @@ router.post("/user/register", sensitiveLimiter, async (req, res) => {
     }
     const hashedPassword = await hashPassword(password);
     const user = await client.query(
-      `INSERT INTO users (name, username, email, phone, password, age, is_verified)
-       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id,name,username,email,phone,role,is_verified`,
-      [name.trim(), username, email, phone, hashedPassword, age, !env.EMAIL_VERIFICATION_ENABLED],
+      `INSERT INTO users (name, username, email, phone, password, age, is_verified, coins_count)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,100) RETURNING id,name,username,email,phone,role,is_verified`,
+      [name.trim(), username, email, phone, hashedPassword, age, false],
     );
     if (referrerId) await client.query("INSERT INTO referrals(referrer_id,referred_user_id,referral_code) VALUES($1,$2,$3)", [referrerId,user.rows[0].id,referralCode]);
-    if (env.EMAIL_VERIFICATION_ENABLED) {
-      await client.query(
-        `INSERT INTO otps(email,otp_code,purpose,expires_at) VALUES($1,$2,'register',NOW()+INTERVAL '15 minutes')
-         ON CONFLICT(email,purpose) DO UPDATE SET otp_code=EXCLUDED.otp_code,expires_at=EXCLUDED.expires_at,is_used=false,failed_attempts=0,created_at=NOW()`,
-        [email, hashOtp(email, "register", otp)],
-      );
-      await SendOtp(email, otp, "register");
-    }
+    await client.query(
+      `INSERT INTO otps(email,otp_code,purpose,expires_at) VALUES($1,$2,'register',NOW()+INTERVAL '15 minutes')
+       ON CONFLICT(email,purpose) DO UPDATE SET otp_code=EXCLUDED.otp_code,expires_at=EXCLUDED.expires_at,is_used=false,failed_attempts=0,created_at=NOW()`,
+      [email, hashOtp(email, "register", otp)],
+    );
+    await SendOtp(email, otp, "register");
     await client.query("COMMIT");
     await logActivity({
       eventType: "user.registered",
@@ -615,14 +613,12 @@ router.post("/user/register", sensitiveLimiter, async (req, res) => {
       description: `${user.rows[0].name} joined the platform`,
       actorId: user.rows[0].id,
       actorName: user.rows[0].name,
-      metadata: { username: user.rows[0].username, verificationRequired: env.EMAIL_VERIFICATION_ENABLED },
+      metadata: { username: user.rows[0].username, verificationRequired: true },
     });
     return res.status(201).json({
       success: true,
-      requiresVerification: env.EMAIL_VERIFICATION_ENABLED,
-      message: env.EMAIL_VERIFICATION_ENABLED
-        ? "Registration successful. Please verify your email."
-        : "Registration successful. You can now sign in.",
+      requiresVerification: true,
+      message: "Registration successful. Please verify your email.",
       user: user.rows[0],
     });
   } catch (error: any) {
@@ -644,7 +640,7 @@ router.post("/login", sensitiveLimiter, async (req, res) => {
     const user = result.rows[0];
     const matches = user?.password ? await comparePassword(validation.data.password, user.password) : false;
     if (!matches) return res.status(401).json({ success: false, message: "Invalid email or phone number or password." });
-    if (!user.is_verified) return res.status(403).json({ success: false, message: "Verify your email before signing in." });
+    if (!user.is_verified) return res.status(403).json({ success: false, code: "EMAIL_NOT_VERIFIED", email: user.email, message: "Verify your email before signing in." });
     await logActivity({ eventType: "user.signed_in", title: "User signed in", description: `${user.name} signed in`, actorId: user.id, actorName: user.name });
     return res.json({ success: true, message: "Sign in successful.", token: signSession(user), user: { id: user.id, name: user.name, username: user.username, email: user.email, phone: user.phone, role: user.role, profile_image_url: user.profile_image_url } });
   } catch (error) {
@@ -665,7 +661,7 @@ router.post("/google", sensitiveLimiter, async (req, res, next) => {
     const base = email.split("@")[0]!.replace(/[^a-z0-9_]/g, "").slice(0, 25) || "player";
     const username = `${base}_${crypto.randomUUID().slice(0, 8)}`;
     const result = await pool.query(
-      `INSERT INTO users(name,username,email,role,is_oauth,is_verified) VALUES($1,$2,$3,'user',true,true)
+      `INSERT INTO users(name,username,email,role,is_oauth,is_verified,coins_count) VALUES($1,$2,$3,'user',true,true,100)
        ON CONFLICT((lower(email))) DO UPDATE SET name=EXCLUDED.name,is_oauth=true,is_verified=true,updated_at=NOW()
        RETURNING id,name,username,email,role,profile_image_url,token_version`,
       [payload.name || base, username, email],
