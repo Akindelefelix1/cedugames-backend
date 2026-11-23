@@ -12,9 +12,17 @@ export const verifyPlayerToken = async (req: AuthenticatedRequest, res: Response
   if (!token) { res.status(401).json({ success: false, code: "SESSION_INVALID", message: "Missing authorization token." }); return; }
   try {
     const decoded = jwt.verify(token, env.JWT_SECRET, { issuer: "cedugames-api", audience: "cedugames-client" }) as { id: string; role: "user" | "admin"; ver: number };
-    const result = await pool.query("SELECT role,token_version,parent_user_id FROM users WHERE id=$1", [decoded.id]);
+    const result = await pool.query(
+      `SELECT u.role,u.token_version,u.parent_user_id,u.is_verified,p.require_player_email_verification
+       FROM users u CROSS JOIN account_access_policy p WHERE u.id=$1 AND p.id=1`,
+      [decoded.id],
+    );
     const user = result.rows[0];
     if (!user || user.parent_user_id || user.role !== decoded.role || user.token_version !== decoded.ver) throw new Error("Session revoked");
+    if (decoded.role === "user" && user.require_player_email_verification && !user.is_verified) {
+      res.status(403).json({ success: false, code: "EMAIL_NOT_VERIFIED", message: "Verify your email before using Cedu." });
+      return;
+    }
     const requestedProfile = String(req.headers["x-player-profile-id"] || "").trim();
     let playerId = decoded.id;
     if (requestedProfile && requestedProfile !== decoded.id) {

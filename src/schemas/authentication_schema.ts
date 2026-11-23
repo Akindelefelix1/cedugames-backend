@@ -54,7 +54,7 @@ const ResendOtpSchema = z.object({
 });
 
 const DeleteChildProfileSchema = z.object({
-  otp: z.string().regex(/^\d{6}$/, "Enter the six-digit code from your email."),
+  otp: z.string().regex(/^\d{6}$/, "Enter the six-digit code from your email.").optional(),
 });
 
 //reset-password zod schema

@@ -10,7 +10,7 @@ import { comparePassword, hashPassword } from "../helpers/hashPassword";
 import { SendOtp } from "../helpers/Mailer";
 import { generateOtp, hashOtp } from "../helpers/otp";
 import { getActivityRetentionDays, logActivity } from "../helpers/activityLog";
-import { verifyAdminToken, verifyPlayerToken, type AuthenticatedRequest } from "../middlewares/authentication_middleware";
+import { verifyAdminToken, verifyPlayerToken, requireSuperAdmin, type AuthenticatedRequest } from "../middlewares/authentication_middleware";
 import {
   AdminLoginSchema, ForgotPasswordSchema, GoogleAuthSchema, UserLoginSchema, RegisterUserSchema,
   DeleteChildProfileSchema, ResendOtpSchema, ResetPasswordSchema, UpdatePassword, VerifyOtpSchema,
@@ -29,6 +29,10 @@ const AccountDeletionRequestSchema = z.object({
   username: z.string().trim().max(80).optional().or(z.literal("")),
   reason: z.string().trim().max(1000).optional().or(z.literal("")),
 });
+const AccountAccessPolicySchema = z.object({
+  requirePlayerEmailVerification: z.boolean(),
+  requireChildDeletionOtp: z.boolean(),
+});
 
 const normalizeEmail = (email: string) => email.trim().toLowerCase();
 const normalizePhone = (phone: string) => {
@@ -37,6 +41,41 @@ const normalizePhone = (phone: string) => {
   if (/^234\d{10}$/.test(cleaned)) return `+${cleaned}`;
   return cleaned;
 };
+
+router.get("/access-policy", async (_req, res) => {
+  const result = await pool.query(
+    "SELECT require_player_email_verification,require_child_deletion_otp FROM account_access_policy WHERE id=1",
+  );
+  const policy = result.rows[0];
+  if (!policy) return res.status(503).json({ success: false, message: "Account access policy is unavailable." });
+  return res.json({ success: true, policy: {
+    requirePlayerEmailVerification: policy.require_player_email_verification,
+    requireChildDeletionOtp: policy.require_child_deletion_otp,
+  } });
+});
+
+router.put("/admin/access-policy", verifyAdminToken,
+  (req: AuthenticatedRequest, res, next) => requireSuperAdmin(req, res, next),
+  async (req: AuthenticatedRequest, res) => {
+    const parsed = AccountAccessPolicySchema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ success: false, message: "Choose valid account access settings." });
+    const policy = parsed.data;
+    const result = await pool.query(
+      `UPDATE account_access_policy SET require_player_email_verification=$1,require_child_deletion_otp=$2,
+       updated_by=$3,updated_at=NOW() WHERE id=1
+       RETURNING require_player_email_verification,require_child_deletion_otp,updated_at`,
+      [policy.requirePlayerEmailVerification, policy.requireChildDeletionOtp, req.user!.role === "super_admin" ? null : req.user!.id],
+    );
+    await logActivity({ eventType: "account.access_policy_updated", title: "Account access policy updated", description: `Email verification ${policy.requirePlayerEmailVerification ? "required" : "optional"}; child deletion OTP ${policy.requireChildDeletionOtp ? "required" : "disabled"}` })
+      .catch((error) => console.error("Account access policy activity log failed", error));
+    const saved = result.rows[0];
+    return res.json({ success: true, policy: {
+      requirePlayerEmailVerification: saved.require_player_email_verification,
+      requireChildDeletionOtp: saved.require_child_deletion_otp,
+      updatedAt: saved.updated_at,
+    } });
+  },
+);
 
 router.post("/account-deletion-requests", sensitiveLimiter, async (req, res) => {
   const validation = AccountDeletionRequestSchema.safeParse(req.body);
@@ -509,6 +548,9 @@ router.post("/user/profiles/:id/delete-otp", verifyPlayerToken, sensitiveLimiter
   const accountId = req.user!.accountId || req.user!.id;
 
   try {
+    const policy = await pool.query("SELECT require_child_deletion_otp FROM account_access_policy WHERE id=1");
+    if (!policy.rows[0]) return res.status(503).json({ success: false, message: "Account access policy is unavailable." });
+    if (!policy.rows[0].require_child_deletion_otp) return res.status(409).json({ success: false, code: "CHILD_DELETE_OTP_DISABLED", message: "Email code verification is disabled. Confirm deletion to continue." });
     const result = await pool.query(
       `SELECT parent.email FROM users child
        JOIN users parent ON parent.id=child.parent_user_id
@@ -561,25 +603,36 @@ router.delete("/user/profiles/:id", verifyPlayerToken, sensitiveLimiter, async (
       return res.status(404).json({ success: false, message: "Child profile not found." });
     }
 
-    const email = normalizeEmail(account.rows[0].email);
-    const purpose = "child_delete";
-    const otp = hashOtp(email, `${purpose}:${childId}`, validation.data.otp);
-    const saved = await client.query(
-      `SELECT id FROM otps WHERE email=$1 AND purpose=$2 AND otp_code=$3 AND is_used=false
-       AND failed_attempts<5 AND expires_at>NOW() FOR UPDATE`,
-      [email, purpose, otp],
-    );
-    if (!saved.rows[0]) {
-      await client.query(
-        `UPDATE otps SET failed_attempts=failed_attempts+1
-         WHERE email=$1 AND purpose=$2 AND is_used=false AND failed_attempts<5 AND expires_at>NOW()`,
-        [email, purpose],
+    const policy = await client.query("SELECT require_child_deletion_otp FROM account_access_policy WHERE id=1");
+    if (!policy.rows[0]) {
+      await client.query("ROLLBACK");
+      return res.status(503).json({ success: false, message: "Account access policy is unavailable." });
+    }
+    if (policy.rows[0].require_child_deletion_otp) {
+      if (!validation.data.otp) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ success: false, message: "Enter the six-digit code from your email." });
+      }
+      const email = normalizeEmail(account.rows[0].email);
+      const purpose = "child_delete";
+      const otp = hashOtp(email, `${purpose}:${childId}`, validation.data.otp);
+      const saved = await client.query(
+        `SELECT id FROM otps WHERE email=$1 AND purpose=$2 AND otp_code=$3 AND is_used=false
+         AND failed_attempts<5 AND expires_at>NOW() FOR UPDATE`,
+        [email, purpose, otp],
       );
-      await client.query("COMMIT");
-      return res.status(400).json({ success: false, message: "Invalid or expired deletion code." });
+      if (!saved.rows[0]) {
+        await client.query(
+          `UPDATE otps SET failed_attempts=failed_attempts+1
+           WHERE email=$1 AND purpose=$2 AND is_used=false AND failed_attempts<5 AND expires_at>NOW()`,
+          [email, purpose],
+        );
+        await client.query("COMMIT");
+        return res.status(400).json({ success: false, message: "Invalid or expired deletion code." });
+      }
+      await client.query("UPDATE otps SET is_used=true WHERE id=$1", [saved.rows[0].id]);
     }
 
-    await client.query("UPDATE otps SET is_used=true WHERE id=$1", [saved.rows[0].id]);
     await client.query("DELETE FROM users WHERE id=$1 AND parent_user_id=$2", [childId, accountId]);
     await client.query("COMMIT");
     await logActivity({ eventType: "profile.child_deleted", title: "Child profile deleted", description: `${account.rows[0].name} deleted ${child.rows[0].name}'s profile`, actorId: accountId, actorName: account.rows[0].name, metadata: { profileId: childId } });
@@ -667,6 +720,9 @@ router.post("/user/register", sensitiveLimiter, async (req, res) => {
   const phone = normalizePhone(validation.data.phone);
   if (!/^\+?[1-9]\d{6,14}$/.test(phone)) return res.status(400).json({ success: false, message: "Enter a valid phone number." });
   const username = validation.data.username.trim().toLowerCase();
+  const accessPolicyResult = await pool.query("SELECT require_player_email_verification FROM account_access_policy WHERE id=1");
+  if (!accessPolicyResult.rows[0]) return res.status(503).json({ success: false, message: "Account access policy is unavailable." });
+  const requiresVerification = Boolean(accessPolicyResult.rows[0].require_player_email_verification);
   const otp = generateOtp();
   const client = await pool.connect();
   try {
@@ -710,15 +766,19 @@ router.post("/user/register", sensitiveLimiter, async (req, res) => {
       description: `${user.rows[0].name} joined the platform`,
       actorId: user.rows[0].id,
       actorName: user.rows[0].name,
-      metadata: { username: user.rows[0].username, verificationRequired: false, verificationEmailSent },
+      metadata: { username: user.rows[0].username, verificationRequired: requiresVerification, verificationEmailSent },
     }).catch((activityError) => console.error("Registration activity could not be recorded", activityError));
     return res.status(201).json({
       success: true,
-      requiresVerification: false,
+      requiresVerification,
       verificationEmailSent,
-      message: verificationEmailSent
-        ? "Registration successful. You can log in now; email verification is optional."
-        : "Registration successful. You can log in now; email verification is optional and can be completed later.",
+      message: requiresVerification
+        ? verificationEmailSent
+          ? "Registration successful. Verify your email before logging in."
+          : "Registration successful, but the verification email could not be sent. Try again later before logging in."
+        : verificationEmailSent
+          ? "Registration successful. You can log in now; email verification is optional."
+          : "Registration successful. You can log in now; email verification is optional and can be completed later.",
       user: user.rows[0],
     });
   } catch (error: any) {
@@ -736,10 +796,17 @@ router.post("/login", sensitiveLimiter, async (req, res) => {
   const email = normalizeEmail(identifier);
   const phone = normalizePhone(identifier);
   try {
-    const result = await pool.query("SELECT id,name,username,email,phone,password,role,is_verified,profile_image_url,token_version FROM users WHERE parent_user_id IS NULL AND (lower(email)=$1 OR phone=$2) LIMIT 1", [email, phone]);
+    const result = await pool.query(
+      `SELECT u.id,u.name,u.username,u.email,u.phone,u.password,u.role,u.is_verified,u.profile_image_url,u.token_version,
+              p.require_player_email_verification
+       FROM users u CROSS JOIN account_access_policy p
+       WHERE u.parent_user_id IS NULL AND (lower(u.email)=$1 OR u.phone=$2) AND p.id=1 LIMIT 1`,
+      [email, phone],
+    );
     const user = result.rows[0];
     const matches = user?.password ? await comparePassword(validation.data.password, user.password) : false;
     if (!matches) return res.status(401).json({ success: false, message: "Invalid email or phone number or password." });
+    if (user.require_player_email_verification && !user.is_verified) return res.status(403).json({ success: false, code: "EMAIL_NOT_VERIFIED", email: user.email, message: "Verify your email before signing in." });
     await logActivity({ eventType: "user.signed_in", title: "User signed in", description: `${user.name} signed in`, actorId: user.id, actorName: user.name });
     return res.json({ success: true, message: "Sign in successful.", token: signSession(user), user: { id: user.id, name: user.name, username: user.username, email: user.email, phone: user.phone, role: user.role, profile_image_url: user.profile_image_url } });
   } catch (error) {
