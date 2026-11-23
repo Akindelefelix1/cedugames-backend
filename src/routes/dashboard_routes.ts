@@ -30,7 +30,7 @@ router.get("/admin/dashboard", verifyAdminToken, async (_req, res) => {
       COUNT(DISTINCT a.level_id) FILTER (WHERE a.passed)::int completed_levels,
       COALESCE(MAX(l.level_number) FILTER (WHERE a.passed),0)::int highest_level FROM users u
       LEFT JOIN gameplay_attempts a ON a.user_id=u.id LEFT JOIN game_levels l ON l.id=a.level_id
-      WHERE u.role='user' AND u.is_verified=true GROUP BY u.id
+      WHERE u.role='user' GROUP BY u.id
       HAVING u.total_xp > 0 OR COUNT(a.id) > 0
       ORDER BY u.total_xp DESC,completed_levels DESC,u.created_at ASC LIMIT 4`),
     pool.query(`SELECT id,event_type,title,description,actor_name,metadata,created_at

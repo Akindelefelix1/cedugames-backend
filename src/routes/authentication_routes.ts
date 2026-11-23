@@ -695,20 +695,30 @@ router.post("/user/register", sensitiveLimiter, async (req, res) => {
        ON CONFLICT(email,purpose) DO UPDATE SET otp_code=EXCLUDED.otp_code,expires_at=EXCLUDED.expires_at,is_used=false,failed_attempts=0,created_at=NOW()`,
       [email, hashOtp(email, "register", otp)],
     );
-    await SendOtp(email, otp, "register");
     await client.query("COMMIT");
+    let verificationEmailSent = false;
+    try {
+      await SendOtp(email, otp, "register");
+      verificationEmailSent = true;
+    } catch (emailError) {
+      // Account creation must remain available while the email provider is down.
+      console.error("Registration verification email could not be sent", emailError);
+    }
     await logActivity({
       eventType: "user.registered",
       title: "New user registered",
       description: `${user.rows[0].name} joined the platform`,
       actorId: user.rows[0].id,
       actorName: user.rows[0].name,
-      metadata: { username: user.rows[0].username, verificationRequired: true },
-    });
+      metadata: { username: user.rows[0].username, verificationRequired: false, verificationEmailSent },
+    }).catch((activityError) => console.error("Registration activity could not be recorded", activityError));
     return res.status(201).json({
       success: true,
-      requiresVerification: true,
-      message: "Registration successful. Please verify your email.",
+      requiresVerification: false,
+      verificationEmailSent,
+      message: verificationEmailSent
+        ? "Registration successful. You can log in now; email verification is optional."
+        : "Registration successful. You can log in now; email verification is optional and can be completed later.",
       user: user.rows[0],
     });
   } catch (error: any) {
@@ -730,7 +740,6 @@ router.post("/login", sensitiveLimiter, async (req, res) => {
     const user = result.rows[0];
     const matches = user?.password ? await comparePassword(validation.data.password, user.password) : false;
     if (!matches) return res.status(401).json({ success: false, message: "Invalid email or phone number or password." });
-    if (!user.is_verified) return res.status(403).json({ success: false, code: "EMAIL_NOT_VERIFIED", email: user.email, message: "Verify your email before signing in." });
     await logActivity({ eventType: "user.signed_in", title: "User signed in", description: `${user.name} signed in`, actorId: user.id, actorName: user.name });
     return res.json({ success: true, message: "Sign in successful.", token: signSession(user), user: { id: user.id, name: user.name, username: user.username, email: user.email, phone: user.phone, role: user.role, profile_image_url: user.profile_image_url } });
   } catch (error) {
