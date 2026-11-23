@@ -512,7 +512,7 @@ router.post("/user/profiles/:id/delete-otp", verifyPlayerToken, sensitiveLimiter
     const result = await pool.query(
       `SELECT parent.email FROM users child
        JOIN users parent ON parent.id=child.parent_user_id
-       WHERE child.id=$1 AND child.parent_user_id=$2 AND parent.role='user' AND parent.is_verified=true`,
+       WHERE child.id=$1 AND child.parent_user_id=$2 AND parent.role='user'`,
       [childId, accountId],
     );
     const email = result.rows[0]?.email;
@@ -554,7 +554,7 @@ router.delete("/user/profiles/:id", verifyPlayerToken, sensitiveLimiter, async (
 
   try {
     await client.query("BEGIN");
-    const account = await client.query("SELECT name,email FROM users WHERE id=$1 AND parent_user_id IS NULL AND role='user' AND is_verified=true FOR UPDATE", [accountId]);
+    const account = await client.query("SELECT name,email FROM users WHERE id=$1 AND parent_user_id IS NULL AND role='user' FOR UPDATE", [accountId]);
     const child = await client.query("SELECT id,name FROM users WHERE id=$1 AND parent_user_id=$2 AND role='user' FOR UPDATE", [childId, accountId]);
     if (!account.rows[0] || !child.rows[0]) {
       await client.query("ROLLBACK");
