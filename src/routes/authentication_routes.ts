@@ -635,7 +635,8 @@ router.delete("/user/profiles/:id", verifyPlayerToken, sensitiveLimiter, async (
 
     await client.query("DELETE FROM users WHERE id=$1 AND parent_user_id=$2", [childId, accountId]);
     await client.query("COMMIT");
-    await logActivity({ eventType: "profile.child_deleted", title: "Child profile deleted", description: `${account.rows[0].name} deleted ${child.rows[0].name}'s profile`, actorId: accountId, actorName: account.rows[0].name, metadata: { profileId: childId } });
+    await logActivity({ eventType: "profile.child_deleted", title: "Child profile deleted", description: `${account.rows[0].name} deleted ${child.rows[0].name}'s profile`, actorId: accountId, actorName: account.rows[0].name, metadata: { profileId: childId } })
+      .catch((error) => console.error("Child profile deletion activity log failed", { childId, error }));
     return res.json({ success: true, message: `${child.rows[0].name}'s profile and learning data were deleted.` });
   } catch (error) {
     await client.query("ROLLBACK");
