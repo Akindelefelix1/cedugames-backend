@@ -747,9 +747,10 @@ router.post("/user/register", sensitiveLimiter, async (req, res) => {
       [name.trim(), username, email, phone, hashedPassword, age, false],
     );
     if (referrerId) await client.query("INSERT INTO referrals(referrer_id,referred_user_id,referral_code) VALUES($1,$2,$3)", [referrerId,user.rows[0].id,referralCode]);
-    await client.query(
+    const savedOtp = await client.query(
       `INSERT INTO otps(email,otp_code,purpose,expires_at) VALUES($1,$2,'register',NOW()+INTERVAL '15 minutes')
-       ON CONFLICT(email,purpose) DO UPDATE SET otp_code=EXCLUDED.otp_code,expires_at=EXCLUDED.expires_at,is_used=false,failed_attempts=0,created_at=NOW()`,
+       ON CONFLICT(email,purpose) DO UPDATE SET otp_code=EXCLUDED.otp_code,expires_at=EXCLUDED.expires_at,is_used=false,failed_attempts=0,created_at=NOW()
+       RETURNING id`,
       [email, hashOtp(email, "register", otp)],
     );
     await client.query("COMMIT");
@@ -760,6 +761,9 @@ router.post("/user/register", sensitiveLimiter, async (req, res) => {
     } catch (emailError) {
       // Account creation must remain available while the email provider is down.
       console.error("Registration verification email could not be sent", emailError);
+      await pool.query("DELETE FROM otps WHERE id=$1", [savedOtp.rows[0].id]).catch((cleanupError: unknown) => {
+        console.error("Failed registration OTP could not be cleared", cleanupError);
+      });
     }
     await logActivity({
       eventType: "user.registered",
