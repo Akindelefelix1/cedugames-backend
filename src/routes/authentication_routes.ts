@@ -570,7 +570,11 @@ router.delete("/user/profiles/:id", verifyPlayerToken, sensitiveLimiter, async (
       [email, purpose, otp],
     );
     if (!saved.rows[0]) {
-      await client.query("UPDATE otps SET failed_attempts=failed_attempts+1 WHERE email=$1 AND purpose=$2 AND is_used=false", [email, purpose]);
+      await client.query(
+        `UPDATE otps SET failed_attempts=failed_attempts+1
+         WHERE email=$1 AND purpose=$2 AND is_used=false AND failed_attempts<5 AND expires_at>NOW()`,
+        [email, purpose],
+      );
       await client.query("COMMIT");
       return res.status(400).json({ success: false, message: "Invalid or expired deletion code." });
     }
@@ -840,7 +844,11 @@ router.post("/verify-otp", sensitiveLimiter, async (req, res) => {
        AND failed_attempts<5 AND expires_at>NOW() FOR UPDATE`, [email, purpose, expected],
     );
     if (!result.rows[0]) {
-      await client.query("UPDATE otps SET failed_attempts=failed_attempts+1 WHERE email=$1 AND purpose=$2 AND is_used=false", [email, purpose]);
+      await client.query(
+        `UPDATE otps SET failed_attempts=failed_attempts+1
+         WHERE email=$1 AND purpose=$2 AND is_used=false AND failed_attempts<5 AND expires_at>NOW()`,
+        [email, purpose],
+      );
       await client.query("COMMIT");
       return res.status(400).json({ success: false, message: "Invalid or expired verification code." });
     }

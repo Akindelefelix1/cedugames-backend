@@ -170,7 +170,11 @@ router.post("/verify-reset-code", sensitiveLimiter, async (req, res) => {
       [email, INSTITUTION_RESET_PURPOSE, hashOtp(email, INSTITUTION_RESET_PURPOSE, input.data.otp)],
     );
     if (!otp.rows[0]) {
-      await client.query("UPDATE otps SET failed_attempts=failed_attempts+1 WHERE email=$1 AND purpose=$2 AND is_used=false", [email, INSTITUTION_RESET_PURPOSE]);
+      await client.query(
+        `UPDATE otps SET failed_attempts=failed_attempts+1
+         WHERE email=$1 AND purpose=$2 AND is_used=false AND failed_attempts<5 AND expires_at>NOW()`,
+        [email, INSTITUTION_RESET_PURPOSE],
+      );
       await client.query("COMMIT");
       return res.status(400).json({ success: false, message: "That code is invalid or expired. Request a new code and try again." });
     }
