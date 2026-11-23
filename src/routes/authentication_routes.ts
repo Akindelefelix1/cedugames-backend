@@ -758,11 +758,11 @@ router.post("/google", sensitiveLimiter, async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
-async function issueOtp(emailValue: string, purpose: "register" | "password_reset") {
+async function issueOtp(emailValue: string, purpose: "register" | "password_reset"): Promise<"sent" | "throttled" | "unavailable"> {
   const email = normalizeEmail(emailValue);
   const user = await pool.query("SELECT id,is_verified FROM users WHERE parent_user_id IS NULL AND lower(email)=$1", [email]);
-  if (!user.rows[0]) return;
-  if (purpose === "register" && user.rows[0].is_verified) return;
+  if (!user.rows[0]) return "unavailable";
+  if (purpose === "register" && user.rows[0].is_verified) return "unavailable";
   const otp = generateOtp();
   const saved = await pool.query(
     `INSERT INTO otps(email,otp_code,purpose,expires_at) VALUES($1,$2,$3,NOW()+INTERVAL '15 minutes')
@@ -770,7 +770,7 @@ async function issueOtp(emailValue: string, purpose: "register" | "password_rese
      WHERE otps.created_at <= NOW()-INTERVAL '60 seconds' RETURNING id`,
     [email, hashOtp(email, purpose, otp), purpose],
   );
-  if (!saved.rowCount) return;
+  if (!saved.rowCount) return "throttled";
   try {
     await SendOtp(email, otp, purpose);
   } catch (error) {
@@ -779,6 +779,7 @@ async function issueOtp(emailValue: string, purpose: "register" | "password_rese
     await pool.query("DELETE FROM otps WHERE id=$1", [saved.rows[0].id]).catch(() => undefined);
     throw error;
   }
+  return "sent";
 }
 
 router.post("/forgot-password", sensitiveLimiter, async (req, res) => {
@@ -792,8 +793,23 @@ router.post("/forgot-password", sensitiveLimiter, async (req, res) => {
 router.post("/resend-otp", sensitiveLimiter, async (req, res) => {
   const validation = ResendOtpSchema.safeParse(req.body);
   if (!validation.success) return res.status(400).json({ success: false, errors: validation.error.issues });
-  try { await issueOtp(validation.data.email, validation.data.purpose); }
-  catch (error) { console.error("OTP resend failed", error); }
+  let result: "sent" | "throttled" | "unavailable";
+  try {
+    result = await issueOtp(validation.data.email, validation.data.purpose);
+  } catch (error) {
+    console.error("OTP resend failed", error);
+    if (validation.data.purpose === "register") {
+      return res.status(503).json({ success: false, message: "We couldn't send the verification code. Please try again shortly." });
+    }
+    return res.json({ success: true, message: "If the account exists, a new code was sent or will be available shortly." });
+  }
+
+  if (validation.data.purpose === "register" && result === "throttled") {
+    return res.status(429).json({ success: false, message: "A code was recently requested. Check your inbox and wait 60 seconds before trying again." });
+  }
+  if (validation.data.purpose === "register" && result === "sent") {
+    return res.json({ success: true, message: "A new verification code was sent. Check your inbox and spam folder." });
+  }
   return res.json({ success: true, message: "If the account exists, a new code was sent or will be available shortly." });
 });
 
