@@ -27,7 +27,7 @@ npm run migrate
 npm start
 ```
 
-Run migrations as a release/pre-deploy job before starting new application instances. Do not run `migrate:down` against production without a verified backup.
+On Render, `preDeployCommand` runs migrations once before the new instance starts. `npm start` only starts the server, so routine restarts do not rerun migrations. If the database returns PostgreSQL error `53000` (quota exceeded), the release still cannot apply migrations or serve database-backed requests until the database provider restores quota or the project plan is upgraded. Do not run `migrate:down` against production without a verified backup.
 
 Do not include trailing slashes in API base URLs or entries in `CORS_ORIGINS`. Configure the reverse proxy to forward `Host`, `X-Forwarded-For`, and `X-Forwarded-Proto`, and route health monitoring to `/health/ready`.
 

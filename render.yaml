@@ -3,7 +3,8 @@ services:
     name: cedugames-backend
     runtime: node
     plan: free
-    buildCommand: npm ci --include=dev && npm run build && npm run migrate
+    buildCommand: npm ci --include=dev && npm run build
+    preDeployCommand: npm run migrate
     startCommand: npm start
     healthCheckPath: /health/ready
     autoDeployTrigger: commit
